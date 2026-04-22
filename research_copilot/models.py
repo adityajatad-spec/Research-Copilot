@@ -130,3 +130,64 @@ class GapReport:
             "underexplored_directions": self.underexplored_directions,
             "explicit_research_gaps": self.explicit_research_gaps,
         }
+
+
+@dataclass(slots=True)
+class ExperimentPlan:
+    """Represent a practical experiment plan for one hypothesis."""
+
+    objective: str
+    datasets: list[str]
+    baselines: list[str]
+    metrics: list[str]
+    implementation_notes: list[str]
+
+    def to_dict(self) -> dict:
+        """Return the experiment plan as a plain dictionary."""
+        return {
+            "objective": self.objective,
+            "datasets": self.datasets,
+            "baselines": self.baselines,
+            "metrics": self.metrics,
+            "implementation_notes": self.implementation_notes,
+        }
+
+
+@dataclass(slots=True)
+class HypothesisItem:
+    """Represent one proposed research hypothesis and its experiment plan."""
+
+    title: str
+    hypothesis: str
+    novelty_rationale: str
+    feasibility_rationale: str
+    experiment_plan: ExperimentPlan
+
+    def to_dict(self) -> dict:
+        """Return the hypothesis item as a plain dictionary."""
+        return {
+            "title": self.title,
+            "hypothesis": self.hypothesis,
+            "novelty_rationale": self.novelty_rationale,
+            "feasibility_rationale": self.feasibility_rationale,
+            "experiment_plan": self.experiment_plan.to_dict(),
+        }
+
+
+@dataclass(slots=True)
+class HypothesisReport:
+    """Represent a set of generated hypotheses for a topic."""
+
+    topic: str
+    paper_count: int
+    generated_from_gaps: list[str]
+    hypotheses: list[HypothesisItem]
+
+    def to_dict(self) -> dict:
+        """Return the hypothesis report as a plain dictionary."""
+        return {
+            "topic": self.topic,
+            "paper_count": self.paper_count,
+            "generated_from_gaps": self.generated_from_gaps,
+            "hypotheses": [item.to_dict() for item in self.hypotheses],
+        }

@@ -11,12 +11,12 @@ from rich.table import Table
 
 try:
     from .fetcher import fetch_papers
-    from .models import Paper
+    from .models import ExperimentPlan, HypothesisItem, Paper
     from .reporter import generate_report
     from .utils import display_papers, load_from_json, save_json_data, save_report, save_to_json
 except ImportError:  # pragma: no cover - fallback for direct script execution
     from fetcher import fetch_papers
-    from models import Paper
+    from models import ExperimentPlan, HypothesisItem, Paper
     from reporter import generate_report
     from utils import display_papers, load_from_json, save_json_data, save_report, save_to_json
 
@@ -31,6 +31,12 @@ DEFAULT_REPORT_INPUT_PATH = "output/summaries.json"
 DEFAULT_REPORT_OUTPUT_PATH = "output/report.md"
 DEFAULT_INSIGHTS_INPUT_PATH = "output/summaries.json"
 DEFAULT_INSIGHTS_OUTPUT_PATH = "output/insights.json"
+DEFAULT_HYPOTHESES_PAPERS_PATH = "output/papers_with_pdf.json"
+DEFAULT_HYPOTHESES_INSIGHTS_PATH = "output/insights.json"
+DEFAULT_HYPOTHESES_GAPS_PATH = "output/gaps.json"
+DEFAULT_HYPOTHESES_OUTPUT_PATH = "output/hypotheses.json"
+DEFAULT_EXPERIMENT_HYPOTHESES_PATH = "output/hypotheses.json"
+DEFAULT_EXPERIMENT_OUTPUT_PATH = "output/experiment.py"
 DEFAULT_GAPS_INPUT_PATH = "output/summaries.json"
 DEFAULT_GAPS_OUTPUT_PATH = "output/gaps.json"
 DEFAULT_PDF_INPUT_PATH = "output/results.json"
@@ -56,6 +62,10 @@ FETCH_SOURCE_HELP_TEXT = "Paper source to query: arxiv, semanticscholar, or hybr
 FETCH_SOURCE_IMPORT_ERROR = "Semantic Scholar support is unavailable: {error}"
 INSIGHTS_PRINT_ERROR = "Could not render insights preview: {error}"
 GAPS_PRINT_ERROR = "Could not render gap analysis preview: {error}"
+HYPOTHESES_PRINT_ERROR = "Could not render hypotheses preview: {error}"
+HYPOTHESES_INPUT_ERROR = "Could not load hypothesis file: {filepath}"
+HYPOTHESES_EMPTY_ERROR = "No hypotheses found in the hypothesis report."
+EXPERIMENT_PRINT_ERROR = "Could not render experiment scaffold preview: {error}"
 
 
 def _truncate(text: str, limit: int = TITLE_LIMIT) -> str:
@@ -178,6 +188,73 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="print_insights",
         help="Print the extracted insights in the terminal",
+    )
+
+    hypotheses_parser = subparsers.add_parser("hypotheses", help="Generate evidence-grounded research hypotheses")
+    hypotheses_parser.add_argument(
+        "--papers",
+        default=DEFAULT_HYPOTHESES_PAPERS_PATH,
+        help="JSON file containing papers with summaries and optional full text",
+    )
+    hypotheses_parser.add_argument(
+        "--insights",
+        default=DEFAULT_HYPOTHESES_INSIGHTS_PATH,
+        help="Optional insights JSON file used as context",
+    )
+    hypotheses_parser.add_argument(
+        "--gaps",
+        default=DEFAULT_HYPOTHESES_GAPS_PATH,
+        help="Optional gaps JSON file used as context",
+    )
+    hypotheses_parser.add_argument(
+        "--output",
+        default=DEFAULT_HYPOTHESES_OUTPUT_PATH,
+        help="Path to save the generated hypotheses JSON",
+    )
+    hypotheses_parser.add_argument(
+        "--topic",
+        default="",
+        help="Research topic label for hypothesis generation",
+    )
+    hypotheses_parser.add_argument(
+        "--provider",
+        default=DEFAULT_PROVIDER,
+        choices=["openai", "ollama"],
+        help=PROVIDER_HELP_TEXT,
+    )
+    hypotheses_parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=MODEL_HELP_TEXT,
+    )
+    hypotheses_parser.add_argument(
+        "--print",
+        action="store_true",
+        dest="print_hypotheses",
+        help="Print generated hypotheses in the terminal",
+    )
+
+    experiment_parser = subparsers.add_parser("experiment", help="Generate a Python experiment scaffold from top hypothesis")
+    experiment_parser.add_argument(
+        "--hypotheses",
+        default=DEFAULT_EXPERIMENT_HYPOTHESES_PATH,
+        help="JSON file containing generated hypotheses",
+    )
+    experiment_parser.add_argument(
+        "--output",
+        default=DEFAULT_EXPERIMENT_OUTPUT_PATH,
+        help="Path to save the generated Python experiment script",
+    )
+    experiment_parser.add_argument(
+        "--topic",
+        default="",
+        help="Optional topic override for the script header",
+    )
+    experiment_parser.add_argument(
+        "--print",
+        action="store_true",
+        dest="print_experiment",
+        help="Print the generated script in the terminal",
     )
 
     gaps_parser = subparsers.add_parser("gaps", help="Detect contradictions and research gaps across papers")
@@ -389,6 +466,55 @@ def _display_gap_report(report: object, console: Console) -> None:
         console.print(table)
 
 
+def _display_hypothesis_report(report: object, console: Console) -> None:
+    """Display a hypothesis report in Rich tables."""
+    overview = Table(show_header=False, box=None)
+    overview.add_row("Topic", getattr(report, "topic", ""))
+    overview.add_row("Paper Count", str(getattr(report, "paper_count", 0)))
+    console.print(overview)
+
+    source_gaps = getattr(report, "generated_from_gaps", [])
+    gaps_table = Table(title="Generated From Gaps", show_header=True, header_style="bold yellow")
+    gaps_table.add_column("#", width=4, justify="right")
+    gaps_table.add_column("Gap", overflow="fold")
+    for index, item in enumerate(source_gaps, start=1):
+        gaps_table.add_row(str(index), item)
+    console.print(gaps_table)
+
+    hypotheses = getattr(report, "hypotheses", [])
+    for index, item in enumerate(hypotheses, start=1):
+        table = Table(title=f"Hypothesis {index}: {item.title}", show_header=False)
+        table.add_row("Hypothesis", item.hypothesis)
+        table.add_row("Novelty", item.novelty_rationale)
+        table.add_row("Feasibility", item.feasibility_rationale)
+        table.add_row("Objective", item.experiment_plan.objective)
+        table.add_row("Datasets", ", ".join(item.experiment_plan.datasets) or "-")
+        table.add_row("Baselines", ", ".join(item.experiment_plan.baselines) or "-")
+        table.add_row("Metrics", ", ".join(item.experiment_plan.metrics) or "-")
+        console.print(table)
+
+
+def _hypothesis_item_from_dict(data: dict) -> HypothesisItem:
+    """Deserialize one hypothesis item from JSON-compatible data."""
+    experiment_plan_data = data.get("experiment_plan", {}) if isinstance(data, dict) else {}
+    plan = ExperimentPlan(
+        objective=str(experiment_plan_data.get("objective", "")),
+        datasets=[str(item) for item in experiment_plan_data.get("datasets", []) if str(item).strip()],
+        baselines=[str(item) for item in experiment_plan_data.get("baselines", []) if str(item).strip()],
+        metrics=[str(item) for item in experiment_plan_data.get("metrics", []) if str(item).strip()],
+        implementation_notes=[
+            str(item) for item in experiment_plan_data.get("implementation_notes", []) if str(item).strip()
+        ],
+    )
+    return HypothesisItem(
+        title=str(data.get("title", "")).strip(),
+        hypothesis=str(data.get("hypothesis", "")).strip(),
+        novelty_rationale=str(data.get("novelty_rationale", "")).strip(),
+        feasibility_rationale=str(data.get("feasibility_rationale", "")).strip(),
+        experiment_plan=plan,
+    )
+
+
 def _run_summarize(args: argparse.Namespace, console: Console) -> None:
     """Run the summarize subcommand."""
     try:
@@ -591,6 +717,107 @@ def _run_gaps(args: argparse.Namespace, console: Console) -> None:
             console.print(f"[yellow]{GAPS_PRINT_ERROR.format(error=error)}[/yellow]")
 
 
+def _run_hypotheses(args: argparse.Namespace, console: Console) -> None:
+    """Run the hypotheses subcommand."""
+    try:
+        from .config import Config
+        from .hypotheses import extract_hypotheses, load_optional_json, save_hypothesis_report
+    except ImportError:  # pragma: no cover - fallback for direct script execution
+        from config import Config
+        from hypotheses import extract_hypotheses, load_optional_json, save_hypothesis_report
+
+    try:
+        papers = load_from_json(args.papers)
+    except FileNotFoundError as error:
+        console.print(f"[yellow]{INPUT_LOAD_ERROR.format(error=error)}[/yellow]")
+        return
+
+    insights_data = load_optional_json(args.insights)
+    gaps_data = load_optional_json(args.gaps)
+    topic = _infer_report_topic(papers, args.topic)
+
+    banner = Panel.fit(
+        f"[bold]Papers:[/bold] {args.papers}\n"
+        f"[bold]Insights:[/bold] {args.insights}\n"
+        f"[bold]Gaps:[/bold] {args.gaps}\n"
+        f"[bold]Output:[/bold] {args.output}\n"
+        f"[bold]Topic:[/bold] {topic}\n"
+        f"[bold]Provider:[/bold] {args.provider}\n"
+        f"[bold]Model:[/bold] {args.model}",
+        title=f"{APP_NAME} Hypotheses",
+        border_style="bright_blue",
+    )
+    console.print(banner)
+
+    config = Config(provider=args.provider, model=args.model)
+    try:
+        report = extract_hypotheses(
+            papers=papers,
+            topic=topic,
+            config=config,
+            insights_data=insights_data,
+            gap_data=gaps_data,
+        )
+    except ValueError as error:
+        console.print(f"[yellow]{SUMMARIZE_CONFIG_ERROR.format(error=error)}[/yellow]")
+        return
+
+    save_hypothesis_report(report, args.output)
+    console.print(f"[green]{SAVE_SUCCESS_MESSAGE.format(filepath=args.output)}[/green]")
+
+    if args.print_hypotheses:
+        try:
+            _display_hypothesis_report(report, console)
+        except Exception as error:
+            console.print(f"[yellow]{HYPOTHESES_PRINT_ERROR.format(error=error)}[/yellow]")
+
+
+def _run_experiment(args: argparse.Namespace, console: Console) -> None:
+    """Run the experiment subcommand."""
+    try:
+        from .experiment_writer import generate_experiment_script, save_experiment_script
+        from .hypotheses import load_optional_json
+    except ImportError:  # pragma: no cover - fallback for direct script execution
+        from experiment_writer import generate_experiment_script, save_experiment_script
+        from hypotheses import load_optional_json
+
+    data = load_optional_json(args.hypotheses)
+    if data is None:
+        console.print(f"[yellow]{HYPOTHESES_INPUT_ERROR.format(filepath=args.hypotheses)}[/yellow]")
+        return
+
+    hypothesis_entries = data.get("hypotheses", []) if isinstance(data, dict) else []
+    if not isinstance(hypothesis_entries, list) or not hypothesis_entries:
+        console.print(f"[yellow]{HYPOTHESES_EMPTY_ERROR}[/yellow]")
+        return
+
+    top_hypothesis = _hypothesis_item_from_dict(hypothesis_entries[0])
+    if not top_hypothesis.title or not top_hypothesis.hypothesis:
+        console.print(f"[yellow]{HYPOTHESES_EMPTY_ERROR}[/yellow]")
+        return
+
+    topic = args.topic.strip() or str(data.get("topic", UNKNOWN_TOPIC)).strip() or UNKNOWN_TOPIC
+    banner = Panel.fit(
+        f"[bold]Hypotheses:[/bold] {args.hypotheses}\n"
+        f"[bold]Output:[/bold] {args.output}\n"
+        f"[bold]Topic:[/bold] {topic}\n"
+        f"[bold]Top Hypothesis:[/bold] {top_hypothesis.title}",
+        title=f"{APP_NAME} Experiment",
+        border_style="green",
+    )
+    console.print(banner)
+
+    script = generate_experiment_script(top_hypothesis, topic)
+    save_experiment_script(script, args.output)
+    console.print(f"[green]{SAVE_SUCCESS_MESSAGE.format(filepath=args.output)}[/green]")
+
+    if args.print_experiment:
+        try:
+            console.print(Markdown(f"```python\n{script}\n```"))
+        except Exception as error:
+            console.print(f"[yellow]{EXPERIMENT_PRINT_ERROR.format(error=error)}[/yellow]")
+
+
 def main() -> None:
     """Run the AI Research Copilot CLI."""
     parser = _build_parser()
@@ -619,6 +846,14 @@ def main() -> None:
 
     if args.command == "gaps":
         _run_gaps(args, console)
+        return
+
+    if args.command == "hypotheses":
+        _run_hypotheses(args, console)
+        return
+
+    if args.command == "experiment":
+        _run_experiment(args, console)
         return
 
 
