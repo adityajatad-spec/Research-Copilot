@@ -15,17 +15,16 @@ except ImportError:  # pragma: no cover - fallback for direct script execution
 ERROR_SCHOLAR_FETCH_FAILED = "Error fetching papers from Semantic Scholar: {error}"
 SCHOLAR_FIELDS = [
     "title",
-    "abstract",
     "authors",
+    "abstract",
     "paperId",
+    "url",
     "externalIds",
     "openAccessPdf",
     "venue",
     "year",
     "citationCount",
     "influentialCitationCount",
-    "topics",
-    "doi",
 ]
 
 
@@ -33,20 +32,46 @@ def _paper_data(result: object) -> dict:
     """Return a Semantic Scholar paper as a plain dictionary."""
     if hasattr(result, "raw_data"):
         return getattr(result, "raw_data")
-    return dict(result)
+    try:
+        return dict(result)
+    except Exception:
+        return {}
+
+
+def _external_ids(data: dict) -> dict:
+    """Return a normalized externalIds dictionary."""
+    raw_external_ids = data.get("externalIds", {}) or {}
+    if isinstance(raw_external_ids, dict):
+        return raw_external_ids
+    return {}
 
 
 def _extract_arxiv_id(data: dict) -> str:
     """Extract a stable paper identifier from Semantic Scholar data."""
-    external_ids = data.get("externalIds", {}) or {}
+    external_ids = _external_ids(data)
     return data.get("arxivId", "") or external_ids.get("ArXiv", "") or data.get("paperId", "")
 
 
-def _extract_categories(data: dict) -> list[str]:
-    """Extract category-like topic names from Semantic Scholar data."""
-    topics = data.get("topics", []) or []
-    categories = [item.get("topic", "") for item in topics if item.get("topic")]
-    return categories
+def _extract_doi(data: dict) -> str:
+    """Extract DOI from top-level or external identifiers when available."""
+    top_level_doi = data.get("doi", "")
+    if isinstance(top_level_doi, str) and top_level_doi.strip():
+        return top_level_doi.strip()
+
+    external_ids = _external_ids(data)
+    direct_doi = external_ids.get("DOI") or external_ids.get("doi")
+    if isinstance(direct_doi, str) and direct_doi.strip():
+        return direct_doi.strip()
+
+    for key, value in external_ids.items():
+        if isinstance(key, str) and key.lower() == "doi" and isinstance(value, str) and value.strip():
+            return value.strip()
+        if isinstance(value, dict):
+            nested_doi = value.get("DOI") or value.get("doi")
+            if isinstance(nested_doi, str) and nested_doi.strip():
+                return nested_doi.strip()
+
+    return ""
 
 
 def fetch_semantic_scholar_papers(topic: str, max_results: int = DEFAULT_MAX_RESULTS) -> list[Paper]:
@@ -71,8 +96,15 @@ def fetch_semantic_scholar_papers(topic: str, max_results: int = DEFAULT_MAX_RES
     papers: list[Paper] = []
     for result in result_items:
         data = _paper_data(result)
-        authors = [author.get("name", "") for author in data.get("authors", []) if author.get("name")]
+        authors_data = data.get("authors", []) or []
+        authors = [
+            author.get("name", "")
+            for author in authors_data
+            if isinstance(author, dict) and author.get("name")
+        ]
         open_access_pdf = data.get("openAccessPdf", {}) or {}
+        if not isinstance(open_access_pdf, dict):
+            open_access_pdf = {}
         papers.append(
             Paper(
                 title=data.get("title", "") or "",
@@ -81,12 +113,12 @@ def fetch_semantic_scholar_papers(topic: str, max_results: int = DEFAULT_MAX_RES
                 arxiv_id=_extract_arxiv_id(data),
                 pdf_url=open_access_pdf.get("url", "") or data.get("pdfUrl", "") or "",
                 published=str(data.get("year", "") or ""),
-                categories=_extract_categories(data),
+                categories=[],
                 source="semanticscholar",
                 citation_count=data.get("citationCount", 0),
                 influential_citations=data.get("influentialCitationCount", 0),
                 venue=data.get("venue", "") or "",
-                doi=data.get("doi", "") or "",
+                doi=_extract_doi(data),
             )
         )
 
