@@ -9,14 +9,14 @@ try:
     from .agent_state import AgentAction, AgentState
     from .config import Config
     from .critic import evaluate_state
-    from .memory_store import load_memory, store_memory, summarize_memory
+    from .memory_store import load_memory, record_experiment_memory, store_memory, summarize_memory
     from .planner import plan_next_step
     from .utils import load_from_json, save_json_data, save_report, save_to_json
 except ImportError:  # pragma: no cover - fallback for direct script execution
     from agent_state import AgentAction, AgentState
     from config import Config
     from critic import evaluate_state
-    from memory_store import load_memory, store_memory, summarize_memory
+    from memory_store import load_memory, record_experiment_memory, store_memory, summarize_memory
     from planner import plan_next_step
     from utils import load_from_json, save_json_data, save_report, save_to_json
 
@@ -34,8 +34,15 @@ OUTPUT_PATHS = {
     "gaps": "output/gaps.json",
     "hypotheses": "output/hypotheses.json",
     "experiment": "output/experiment.py",
+    "run_experiment": "output/experiment_run/results.json",
 }
 PARAM_PATTERN = re.compile(r"(?P<key>[a-zA-Z0-9_-]+)=(?P<value>[^ ]+)")
+DEFAULT_EXPERIMENT_DATASET = "demo-dataset"
+DEFAULT_EXPERIMENT_OUTPUT_DIR = "output/experiment_run"
+DEFAULT_EXPERIMENT_EPOCHS = 1
+DEFAULT_EXPERIMENT_LEARNING_RATE = 1e-4
+DEFAULT_EXPERIMENT_SEED = 42
+DEFAULT_EXPERIMENT_TIMEOUT = 120
 
 
 def _parse_params(input_text: str) -> dict[str, str]:
@@ -52,6 +59,16 @@ def _safe_int(value: str | None, default: int) -> int:
         return default
     try:
         return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _safe_float(value: str | None, default: float) -> float:
+    """Parse a float safely with a fallback."""
+    if value is None:
+        return default
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return default
 
@@ -301,7 +318,48 @@ def execute_action(state: AgentState, action: str, input_text: str, provider: st
         script = generate_experiment_script(top_hypothesis, report_data.get("topic", topic))
         save_experiment_script(script, OUTPUT_PATHS["experiment"])
         store_memory(state, "experiment_output_path", OUTPUT_PATHS["experiment"])
+        store_memory(state, "experiment_script_path", OUTPUT_PATHS["experiment"])
         return "Experiment scaffold generated."
+
+    if action == "run_experiment":
+        try:
+            from .result_parser import load_experiment_results, summarize_experiment_result
+            from .run_experiment import safe_run_experiment
+        except ImportError:  # pragma: no cover - fallback for direct script execution
+            from result_parser import load_experiment_results, summarize_experiment_result
+            from run_experiment import safe_run_experiment
+
+        script_path = params.get("script") or load_memory(state, "experiment_script_path") or OUTPUT_PATHS["experiment"]
+        dataset = params.get("dataset", DEFAULT_EXPERIMENT_DATASET)
+        output_dir = params.get("output_dir", DEFAULT_EXPERIMENT_OUTPUT_DIR)
+        epochs = _safe_int(params.get("epochs"), DEFAULT_EXPERIMENT_EPOCHS)
+        learning_rate = _safe_float(params.get("learning_rate"), DEFAULT_EXPERIMENT_LEARNING_RATE)
+        seed = _safe_int(params.get("seed"), DEFAULT_EXPERIMENT_SEED)
+        timeout = _safe_int(params.get("timeout"), DEFAULT_EXPERIMENT_TIMEOUT)
+
+        if not Path(script_path).exists():
+            execute_action(state, "experiment", "", provider, model)
+            script_path = load_memory(state, "experiment_script_path", OUTPUT_PATHS["experiment"])
+
+        run_result = safe_run_experiment(
+            script_path=script_path,
+            dataset=dataset,
+            output_dir=output_dir,
+            epochs=epochs,
+            learning_rate=learning_rate,
+            seed=seed,
+            timeout=timeout,
+        )
+        parsed_results = None
+        results_path = run_result.get("results_path")
+        if isinstance(results_path, str) and results_path:
+            parsed_results = load_experiment_results(results_path)
+
+        record_experiment_memory(state, run_result, parsed_results)
+        store_memory(state, "experiment_script_path", script_path)
+        store_memory(state, "run_experiment_output_dir", output_dir)
+
+        return summarize_experiment_result(run_result, parsed_results)
 
     if action == "finish":
         return "Planner requested finish."
@@ -326,6 +384,17 @@ def safe_execute(state: AgentState, action: str, input_text: str, reason: str, p
     """Execute an action safely and record success/failure details."""
     try:
         result = execute_action(state, action, input_text, provider, model)
+        if action == "run_experiment" and not bool(load_memory(state, "experiment_success", False)):
+            record_action(state, action, input_text, reason, "failed")
+            state.last_result = result
+            store_memory(state, "last_error", result)
+            failed_counts = load_memory(state, "failed_action_counts", {})
+            if not isinstance(failed_counts, dict):
+                failed_counts = {}
+            failed_counts[action] = failed_counts.get(action, 0) + 1
+            store_memory(state, "failed_action_counts", failed_counts)
+            return result
+
         record_action(state, action, input_text, reason, "completed")
         state.last_result = result
         store_memory(state, "last_success_action", action)
@@ -337,6 +406,8 @@ def safe_execute(state: AgentState, action: str, input_text: str, reason: str, p
         store_memory(state, "last_error", error_message)
 
         failed_counts = load_memory(state, "failed_action_counts", {})
+        if not isinstance(failed_counts, dict):
+            failed_counts = {}
         failed_counts[action] = failed_counts.get(action, 0) + 1
         store_memory(state, "failed_action_counts", failed_counts)
         return error_message
@@ -357,6 +428,19 @@ def _final_output_paths(state: AgentState) -> dict[str, str]:
         )
         if completed_in_run and Path(default_path).exists():
             paths[action] = default_path
+
+    experiment_script = state.memory.get("experiment_script_path") or state.memory.get("experiment_output_path")
+    if isinstance(experiment_script, str) and Path(experiment_script).exists():
+        paths["experiment_script"] = experiment_script
+    elif Path(OUTPUT_PATHS["experiment"]).exists():
+        paths["experiment_script"] = OUTPUT_PATHS["experiment"]
+
+    experiment_results = state.memory.get("experiment_results_path") or state.memory.get("run_experiment_output_path")
+    if isinstance(experiment_results, str) and Path(experiment_results).exists():
+        paths["experiment_results"] = experiment_results
+    elif Path(OUTPUT_PATHS["run_experiment"]).exists():
+        paths["experiment_results"] = OUTPUT_PATHS["run_experiment"]
+
     return paths
 
 

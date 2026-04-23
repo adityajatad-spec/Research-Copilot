@@ -34,3 +34,34 @@ def summarize_memory(state: AgentState) -> str:
         else:
             lines.append(f"{key}: {value}")
     return "; ".join(lines)
+
+
+def _tail_text(value: object, limit: int = 500) -> str:
+    """Return the trailing text segment for compact memory storage."""
+    text = str(value or "")
+    if len(text) <= limit:
+        return text
+    return text[-limit:]
+
+
+def record_experiment_memory(state: AgentState, run_result: dict, parsed_results: dict | None) -> None:
+    """Store structured experiment execution evidence in agent memory."""
+    try:
+        from .result_parser import extract_result_signals, summarize_experiment_result
+    except ImportError:  # pragma: no cover - fallback for direct script execution
+        from result_parser import extract_result_signals, summarize_experiment_result
+
+    signals = extract_result_signals(parsed_results)
+    summary = summarize_experiment_result(run_result, parsed_results)
+
+    store_memory(state, "experiment_success", bool(run_result.get("success")))
+    store_memory(state, "experiment_has_run", True)
+    store_memory(state, "experiment_results_path", run_result.get("results_path"))
+    store_memory(state, "experiment_signal_summary", summary)
+    store_memory(state, "experiment_stdout_tail", _tail_text(run_result.get("stdout")))
+    store_memory(state, "experiment_stderr_tail", _tail_text(run_result.get("stderr")))
+    store_memory(state, "experiment_metric_keys", signals.get("metric_keys", []))
+    store_memory(state, "experiment_last_run", run_result)
+
+    if run_result.get("results_path"):
+        store_memory(state, "run_experiment_output_path", run_result.get("results_path"))

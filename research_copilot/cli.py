@@ -45,6 +45,14 @@ DEFAULT_PDF_INPUT_PATH = "output/results.json"
 DEFAULT_PDF_OUTPUT_PATH = "output/papers_with_pdf.json"
 DEFAULT_PDF_DIR = "output/pdfs"
 DEFAULT_PDF_MAX_PAGES = 10
+DEFAULT_RUN_EXPERIMENT_SCRIPT = "output/experiment.py"
+DEFAULT_RUN_EXPERIMENT_DATASET = "demo-dataset"
+DEFAULT_RUN_EXPERIMENT_OUTPUT_DIR = "output/experiment_run"
+DEFAULT_RUN_EXPERIMENT_EPOCHS = 1
+DEFAULT_RUN_EXPERIMENT_LEARNING_RATE = 1e-4
+DEFAULT_RUN_EXPERIMENT_SEED = 42
+DEFAULT_RUN_EXPERIMENT_TIMEOUT = 120
+DEFAULT_RUN_EXPERIMENT_SUMMARY_PATH = "output/experiment_run_summary.json"
 DEFAULT_AGENT_OUTPUT_PATH = "output/agent_run.json"
 DEFAULT_AGENT_MAX_ITERATIONS = 6
 DEFAULT_PROVIDER = "ollama"
@@ -52,6 +60,7 @@ DEFAULT_MODEL = "llama3.2"
 EMPTY_TOPIC_MESSAGE = "Please provide a non-empty research topic."
 INVALID_MAX_MESSAGE = "--max must be greater than 0."
 INVALID_AGENT_ITERATIONS_MESSAGE = "--max-iterations must be greater than 0."
+INVALID_EXPERIMENT_TIMEOUT_MESSAGE = "--timeout must be greater than 0."
 NO_RESULTS_MESSAGE = "No papers found for that topic."
 NO_SAVE_MESSAGE = "Skipping JSON export because --no-save was provided."
 SAVE_SUCCESS_MESSAGE = "Saved results to {filepath}"
@@ -71,6 +80,7 @@ HYPOTHESES_PRINT_ERROR = "Could not render hypotheses preview: {error}"
 HYPOTHESES_INPUT_ERROR = "Could not load hypothesis file: {filepath}"
 HYPOTHESES_EMPTY_ERROR = "No hypotheses found in the hypothesis report."
 EXPERIMENT_PRINT_ERROR = "Could not render experiment scaffold preview: {error}"
+RUN_EXPERIMENT_PRINT_ERROR = "Could not render run summary preview: {error}"
 AGENT_RUN_ERROR = "Agent run failed: {error}"
 AGENT_PRINT_ERROR = "Could not render agent run summary: {error}"
 
@@ -262,6 +272,53 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="print_experiment",
         help="Print the generated script in the terminal",
+    )
+
+    run_experiment_parser = subparsers.add_parser("run-experiment", help="Run a generated experiment script locally")
+    run_experiment_parser.add_argument(
+        "--script",
+        default=DEFAULT_RUN_EXPERIMENT_SCRIPT,
+        help="Path to the experiment Python script",
+    )
+    run_experiment_parser.add_argument(
+        "--dataset",
+        default=DEFAULT_RUN_EXPERIMENT_DATASET,
+        help="Dataset name or path to pass to the experiment script",
+    )
+    run_experiment_parser.add_argument(
+        "--output-dir",
+        default=DEFAULT_RUN_EXPERIMENT_OUTPUT_DIR,
+        help="Directory where the experiment script should write run outputs",
+    )
+    run_experiment_parser.add_argument(
+        "--epochs",
+        type=int,
+        default=DEFAULT_RUN_EXPERIMENT_EPOCHS,
+        help="Epoch count passed to the experiment script",
+    )
+    run_experiment_parser.add_argument(
+        "--learning-rate",
+        type=float,
+        default=DEFAULT_RUN_EXPERIMENT_LEARNING_RATE,
+        help="Learning rate passed to the experiment script",
+    )
+    run_experiment_parser.add_argument(
+        "--seed",
+        type=int,
+        default=DEFAULT_RUN_EXPERIMENT_SEED,
+        help="Random seed passed to the experiment script",
+    )
+    run_experiment_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=DEFAULT_RUN_EXPERIMENT_TIMEOUT,
+        help="Timeout in seconds for experiment execution",
+    )
+    run_experiment_parser.add_argument(
+        "--print",
+        action="store_true",
+        dest="print_run_experiment",
+        help="Print a compact execution summary in the terminal",
     )
 
     gaps_parser = subparsers.add_parser("gaps", help="Detect contradictions and research gaps across papers")
@@ -860,6 +917,83 @@ def _run_experiment(args: argparse.Namespace, console: Console) -> None:
             console.print(f"[yellow]{EXPERIMENT_PRINT_ERROR.format(error=error)}[/yellow]")
 
 
+def _display_run_experiment_summary(run_result: dict, signals: dict, console: Console) -> None:
+    """Display a compact summary for one experiment execution."""
+    table = Table(show_header=True, header_style="bold cyan")
+    table.add_column("Field")
+    table.add_column("Value", overflow="fold")
+    table.add_row("Success", str(run_result.get("success", False)))
+    table.add_row("Return Code", str(run_result.get("returncode")))
+    table.add_row("Results Path", str(run_result.get("results_path") or "-"))
+    table.add_row("Metric Keys", ", ".join(str(item) for item in signals.get("metric_keys", [])) or "-")
+    stderr_tail = str(run_result.get("stderr", ""))
+    stderr_tail = stderr_tail[-300:] if len(stderr_tail) > 300 else stderr_tail
+    table.add_row("stderr tail", stderr_tail or "-")
+    console.print(table)
+
+
+def _run_run_experiment(args: argparse.Namespace, console: Console) -> None:
+    """Run the run-experiment subcommand."""
+    try:
+        from .result_parser import extract_result_signals, load_experiment_results, summarize_experiment_result
+        from .run_experiment import safe_run_experiment
+    except ImportError:  # pragma: no cover - fallback for direct script execution
+        from result_parser import extract_result_signals, load_experiment_results, summarize_experiment_result
+        from run_experiment import safe_run_experiment
+
+    if args.timeout <= 0:
+        console.print(f"[yellow]{INVALID_EXPERIMENT_TIMEOUT_MESSAGE}[/yellow]")
+        return
+
+    banner = Panel.fit(
+        f"[bold]Script:[/bold] {args.script}\n"
+        f"[bold]Dataset:[/bold] {args.dataset}\n"
+        f"[bold]Output Dir:[/bold] {args.output_dir}\n"
+        f"[bold]Epochs:[/bold] {args.epochs}\n"
+        f"[bold]Learning Rate:[/bold] {args.learning_rate}\n"
+        f"[bold]Seed:[/bold] {args.seed}\n"
+        f"[bold]Timeout:[/bold] {args.timeout}s",
+        title=f"{APP_NAME} Run Experiment",
+        border_style="bright_magenta",
+    )
+    console.print(banner)
+
+    run_result = safe_run_experiment(
+        script_path=args.script,
+        dataset=args.dataset,
+        output_dir=args.output_dir,
+        epochs=args.epochs,
+        learning_rate=args.learning_rate,
+        seed=args.seed,
+        timeout=args.timeout,
+    )
+    parsed_results = None
+    results_path = run_result.get("results_path")
+    if isinstance(results_path, str) and results_path:
+        parsed_results = load_experiment_results(results_path)
+
+    signals = extract_result_signals(parsed_results)
+    summary_text = summarize_experiment_result(run_result, parsed_results)
+    summary_payload = {
+        "summary": summary_text,
+        "success": bool(run_result.get("success")),
+        "returncode": run_result.get("returncode"),
+        "script_path": run_result.get("script_path"),
+        "output_dir": run_result.get("output_dir"),
+        "results_path": run_result.get("results_path"),
+        "error": run_result.get("error"),
+        "signals": signals,
+    }
+    save_json_data(summary_payload, DEFAULT_RUN_EXPERIMENT_SUMMARY_PATH)
+    console.print(f"[green]{SAVE_SUCCESS_MESSAGE.format(filepath=DEFAULT_RUN_EXPERIMENT_SUMMARY_PATH)}[/green]")
+
+    if args.print_run_experiment:
+        try:
+            _display_run_experiment_summary(run_result, signals, console)
+        except Exception as error:
+            console.print(f"[yellow]{RUN_EXPERIMENT_PRINT_ERROR.format(error=error)}[/yellow]")
+
+
 def _display_agent_run_summary(run_result: dict, console: Console) -> None:
     """Display a readable summary of one autonomous agent run."""
     overview = Table(show_header=False, box=None)
@@ -985,6 +1119,10 @@ def main() -> None:
 
     if args.command == "experiment":
         _run_experiment(args, console)
+        return
+
+    if args.command == "run-experiment":
+        _run_run_experiment(args, console)
         return
 
     if args.command == "agent":

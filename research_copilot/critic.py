@@ -21,12 +21,38 @@ DEFAULT_OUTPUT_PATHS = {
     "gaps": "output/gaps.json",
     "hypotheses": "output/hypotheses.json",
     "experiment": "output/experiment.py",
+    "run_experiment": "output/experiment_run/results.json",
 }
 ACTION_ORDER = ["fetch", "pdf", "summarize", "report", "insights", "gaps", "hypotheses", "experiment"]
+MAX_CONSECUTIVE_FAILURES = 3
+
+
+def _failed_action_count(state: AgentState, action: str) -> int:
+    """Return failed attempts for one action from memory/history."""
+    counts = state.memory.get("failed_action_counts", {})
+    if isinstance(counts, dict):
+        value = counts.get(action, 0)
+        if isinstance(value, int):
+            return value
+
+    return sum(1 for item in state.history if item.action == action and item.status == "failed")
+
+
+def _consecutive_failures(state: AgentState) -> int:
+    """Count how many failed actions appear consecutively at the end of history."""
+    count = 0
+    for item in reversed(state.history):
+        if item.status != "failed":
+            break
+        count += 1
+    return count
 
 
 def _artifact_exists(state: AgentState, action: str) -> bool:
     """Check whether a required artifact exists for the current run."""
+    if action == "run_experiment":
+        return bool(state.memory.get("experiment_success"))
+
     if action not in DEFAULT_OUTPUT_PATHS:
         return False
 
@@ -53,19 +79,29 @@ def _next_missing_action(state: AgentState) -> str | None:
     return None
 
 
+def _experiment_has_run(state: AgentState) -> bool:
+    """Return whether experiment execution has been attempted in this run."""
+    if bool(state.memory.get("experiment_has_run")):
+        return True
+    return any(item.action == "run_experiment" for item in state.history)
+
+
 def generate_critic_prompt(state: AgentState) -> tuple[str, str]:
     """Generate critic system and user prompts with JSON-only instructions."""
     system_prompt = (
         "You are a critic module for an autonomous research pipeline.\n"
         "Return ONLY JSON with keys: status, reason.\n"
         "status must be either 'continue' or 'done'.\n"
-        "Be conservative and ensure the pipeline has enough evidence before 'done'."
+        "Use experiment execution signals when available and avoid unbounded retries."
     )
     user_prompt = (
         f"Topic: {state.topic}\n"
         f"Iteration: {state.iteration}/{state.max_iterations}\n"
         f"Done flag: {state.done}\n"
         f"Last result: {state.last_result}\n"
+        f"Experiment success: {state.memory.get('experiment_success')}\n"
+        f"Experiment has run: {state.memory.get('experiment_has_run')}\n"
+        f"Experiment summary: {state.memory.get('experiment_signal_summary')}\n"
         f"Memory summary: {summarize_memory(state)}\n"
         "Return JSON only."
     )
@@ -77,8 +113,11 @@ def fallback_critic(state: AgentState) -> dict:
     if state.iteration >= state.max_iterations:
         return {"status": "done", "reason": "Maximum iterations reached."}
 
-    if _artifact_exists(state, "experiment"):
-        return {"status": "done", "reason": "Experiment scaffold exists."}
+    if _artifact_exists(state, "run_experiment"):
+        return {"status": "done", "reason": "Experiment execution succeeded."}
+
+    if _artifact_exists(state, "experiment") and not _experiment_has_run(state):
+        return {"status": "continue", "reason": "Experiment script exists but has not been executed yet."}
 
     return {"status": "continue", "reason": "Pipeline is not complete yet."}
 
@@ -88,8 +127,33 @@ def evaluate_state(state: AgentState) -> dict:
     if state.iteration >= state.max_iterations:
         return {"status": "done", "reason": "Maximum iterations reached."}
 
-    if _artifact_exists(state, "experiment"):
-        return {"status": "done", "reason": "Experiment scaffold generated successfully."}
+    if _consecutive_failures(state) >= MAX_CONSECUTIVE_FAILURES:
+        return {
+            "status": "done",
+            "reason": f"Stopping after {MAX_CONSECUTIVE_FAILURES} consecutive failed actions.",
+        }
+
+    if _artifact_exists(state, "run_experiment"):
+        return {"status": "done", "reason": "Experiment execution succeeded with usable evidence."}
+
+    experiment_script_exists = _artifact_exists(state, "experiment")
+    experiment_has_run = _experiment_has_run(state)
+    run_failures = _failed_action_count(state, "run_experiment")
+    experiment_success = bool(state.memory.get("experiment_success"))
+
+    if experiment_script_exists and not experiment_has_run:
+        return {"status": "continue", "reason": "Experiment script exists but has not been executed yet."}
+
+    if experiment_script_exists and experiment_has_run and not experiment_success:
+        if run_failures >= 2:
+            return {
+                "status": "done",
+                "reason": "Experiment execution failed multiple times; analytical outputs are already available.",
+            }
+        return {
+            "status": "continue",
+            "reason": "Experiment execution failed; one bounded retry is allowed.",
+        }
 
     missing_action = _next_missing_action(state)
     if missing_action is None:

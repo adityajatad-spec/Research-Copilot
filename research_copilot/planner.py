@@ -24,9 +24,10 @@ PLANNER_ACTIONS = [
     "gaps",
     "hypotheses",
     "experiment",
+    "run_experiment",
     "finish",
 ]
-ACTION_ORDER = ["fetch", "pdf", "summarize", "report", "insights", "gaps", "hypotheses", "experiment"]
+ACTION_ORDER = ["fetch", "pdf", "summarize", "report", "insights", "gaps", "hypotheses", "experiment", "run_experiment"]
 DEFAULT_OUTPUT_PATHS = {
     "fetch": "output/results.json",
     "pdf": "output/papers_with_pdf.json",
@@ -36,6 +37,7 @@ DEFAULT_OUTPUT_PATHS = {
     "gaps": "output/gaps.json",
     "hypotheses": "output/hypotheses.json",
     "experiment": "output/experiment.py",
+    "run_experiment": "output/experiment_run/results.json",
 }
 
 
@@ -51,6 +53,9 @@ def _failed_counts(state: AgentState) -> dict[str, int]:
 
 def _artifact_exists(state: AgentState, action: str) -> bool:
     """Check if an action artifact exists for the current run."""
+    if action == "run_experiment":
+        return bool(state.memory.get("experiment_success"))
+
     if action not in DEFAULT_OUTPUT_PATHS:
         return False
 
@@ -98,6 +103,11 @@ def _default_input_for(action: str, state: AgentState) -> str:
         )
     if action == "experiment":
         return f"hypotheses=output/hypotheses.json output=output/experiment.py topic={state.topic}"
+    if action == "run_experiment":
+        return (
+            "script=output/experiment.py dataset=demo-dataset output_dir=output/experiment_run "
+            "epochs=1 learning_rate=1e-4 seed=42 timeout=120"
+        )
     return ""
 
 
@@ -118,6 +128,8 @@ def _strategy_change_action(action: str) -> str:
     if action == "hypotheses":
         return "experiment"
     if action == "experiment":
+        return "run_experiment"
+    if action == "run_experiment":
         return "finish"
     return "finish"
 
@@ -151,7 +163,7 @@ def generate_planner_prompt(state: AgentState) -> tuple[str, str]:
     system_prompt = (
         "You are a planning module for an autonomous research pipeline.\n"
         "Return ONLY valid JSON with keys: thought, action, input.\n"
-        "Allowed actions: fetch, pdf, summarize, report, insights, gaps, hypotheses, experiment, finish.\n"
+        "Allowed actions: fetch, pdf, summarize, report, insights, gaps, hypotheses, experiment, run_experiment, finish.\n"
         "Choose the minimum next step needed. Avoid repeating failed actions."
     )
 
