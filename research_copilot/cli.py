@@ -10,11 +10,13 @@ from rich.panel import Panel
 from rich.table import Table
 
 try:
+    from .agent_loop import run_agent
     from .fetcher import fetch_papers
     from .models import ExperimentPlan, HypothesisItem, Paper
     from .reporter import generate_report
     from .utils import display_papers, load_from_json, save_json_data, save_report, save_to_json
 except ImportError:  # pragma: no cover - fallback for direct script execution
+    from agent_loop import run_agent
     from fetcher import fetch_papers
     from models import ExperimentPlan, HypothesisItem, Paper
     from reporter import generate_report
@@ -43,10 +45,13 @@ DEFAULT_PDF_INPUT_PATH = "output/results.json"
 DEFAULT_PDF_OUTPUT_PATH = "output/papers_with_pdf.json"
 DEFAULT_PDF_DIR = "output/pdfs"
 DEFAULT_PDF_MAX_PAGES = 10
+DEFAULT_AGENT_OUTPUT_PATH = "output/agent_run.json"
+DEFAULT_AGENT_MAX_ITERATIONS = 6
 DEFAULT_PROVIDER = "ollama"
 DEFAULT_MODEL = "llama3.2"
 EMPTY_TOPIC_MESSAGE = "Please provide a non-empty research topic."
 INVALID_MAX_MESSAGE = "--max must be greater than 0."
+INVALID_AGENT_ITERATIONS_MESSAGE = "--max-iterations must be greater than 0."
 NO_RESULTS_MESSAGE = "No papers found for that topic."
 NO_SAVE_MESSAGE = "Skipping JSON export because --no-save was provided."
 SAVE_SUCCESS_MESSAGE = "Saved results to {filepath}"
@@ -66,6 +71,8 @@ HYPOTHESES_PRINT_ERROR = "Could not render hypotheses preview: {error}"
 HYPOTHESES_INPUT_ERROR = "Could not load hypothesis file: {filepath}"
 HYPOTHESES_EMPTY_ERROR = "No hypotheses found in the hypothesis report."
 EXPERIMENT_PRINT_ERROR = "Could not render experiment scaffold preview: {error}"
+AGENT_RUN_ERROR = "Agent run failed: {error}"
+AGENT_PRINT_ERROR = "Could not render agent run summary: {error}"
 
 
 def _truncate(text: str, limit: int = TITLE_LIMIT) -> str:
@@ -317,6 +324,41 @@ def _build_parser() -> argparse.ArgumentParser:
         "--verbose",
         action="store_true",
         help="Show per-paper progress details while parsing PDFs",
+    )
+
+    agent_parser = subparsers.add_parser("agent", help="Run the autonomous research agent loop")
+    agent_parser.add_argument(
+        "--topic",
+        required=True,
+        help="Research topic for autonomous pipeline execution",
+    )
+    agent_parser.add_argument(
+        "--provider",
+        default=DEFAULT_PROVIDER,
+        choices=["openai", "ollama"],
+        help=PROVIDER_HELP_TEXT,
+    )
+    agent_parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=MODEL_HELP_TEXT,
+    )
+    agent_parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=DEFAULT_AGENT_MAX_ITERATIONS,
+        help="Maximum autonomous planning iterations (hard-capped internally at 8)",
+    )
+    agent_parser.add_argument(
+        "--output",
+        default=DEFAULT_AGENT_OUTPUT_PATH,
+        help="Path to save the final agent run JSON",
+    )
+    agent_parser.add_argument(
+        "--print",
+        action="store_true",
+        dest="print_agent",
+        help="Print a readable summary of the agent run",
     )
 
     return parser
@@ -818,6 +860,95 @@ def _run_experiment(args: argparse.Namespace, console: Console) -> None:
             console.print(f"[yellow]{EXPERIMENT_PRINT_ERROR.format(error=error)}[/yellow]")
 
 
+def _display_agent_run_summary(run_result: dict, console: Console) -> None:
+    """Display a readable summary of one autonomous agent run."""
+    overview = Table(show_header=False, box=None)
+    overview.add_row("Topic", str(run_result.get("topic", "")))
+    overview.add_row("Done", str(run_result.get("done", False)))
+    overview.add_row("Iterations", str(run_result.get("iterations", 0)))
+    console.print(overview)
+
+    history = run_result.get("history", [])
+    history_table = Table(title="Action History", show_header=True, header_style="bold cyan")
+    history_table.add_column("Step", justify="right", width=6)
+    history_table.add_column("Action", width=12)
+    history_table.add_column("Status", width=10)
+    history_table.add_column("Reason", overflow="fold")
+
+    if isinstance(history, list) and history:
+        for item in history:
+            if not isinstance(item, dict):
+                continue
+            history_table.add_row(
+                str(item.get("step", "")),
+                str(item.get("action", "")),
+                str(item.get("status", "")),
+                _truncate(str(item.get("reason", "")), limit=100),
+            )
+    else:
+        history_table.add_row("-", "-", "-", "No actions recorded.")
+
+    console.print(history_table)
+
+    memory_summary = str(run_result.get("memory_summary", "No memory summary available."))
+    console.print(Panel.fit(memory_summary, title="Memory Summary", border_style="green"))
+
+    output_paths = run_result.get("final_output_paths", {})
+    paths_table = Table(title="Output Paths", show_header=True, header_style="bold magenta")
+    paths_table.add_column("Artifact")
+    paths_table.add_column("Path", overflow="fold")
+
+    if isinstance(output_paths, dict) and output_paths:
+        for key, value in output_paths.items():
+            paths_table.add_row(str(key), str(value))
+    else:
+        paths_table.add_row("-", "No output artifacts found.")
+
+    console.print(paths_table)
+
+
+def _run_agent(args: argparse.Namespace, console: Console) -> None:
+    """Run the autonomous agent subcommand."""
+    topic = args.topic.strip()
+    if not topic:
+        console.print(f"[yellow]{EMPTY_TOPIC_MESSAGE}[/yellow]")
+        return
+
+    if args.max_iterations <= 0:
+        console.print(f"[yellow]{INVALID_AGENT_ITERATIONS_MESSAGE}[/yellow]")
+        return
+
+    banner = Panel.fit(
+        f"[bold]Topic:[/bold] {topic}\n"
+        f"[bold]Provider:[/bold] {args.provider}\n"
+        f"[bold]Model:[/bold] {args.model}\n"
+        f"[bold]Max Iterations:[/bold] {args.max_iterations}",
+        title=f"{APP_NAME} Agent",
+        border_style="bright_green",
+    )
+    console.print(banner)
+
+    try:
+        run_result = run_agent(
+            topic=topic,
+            provider=args.provider,
+            model=args.model,
+            max_iterations=args.max_iterations,
+        )
+    except Exception as error:
+        console.print(f"[yellow]{AGENT_RUN_ERROR.format(error=error)}[/yellow]")
+        return
+
+    save_json_data(run_result, args.output)
+    console.print(f"[green]{SAVE_SUCCESS_MESSAGE.format(filepath=args.output)}[/green]")
+
+    if args.print_agent:
+        try:
+            _display_agent_run_summary(run_result, console)
+        except Exception as error:
+            console.print(f"[yellow]{AGENT_PRINT_ERROR.format(error=error)}[/yellow]")
+
+
 def main() -> None:
     """Run the AI Research Copilot CLI."""
     parser = _build_parser()
@@ -854,6 +985,10 @@ def main() -> None:
 
     if args.command == "experiment":
         _run_experiment(args, console)
+        return
+
+    if args.command == "agent":
+        _run_agent(args, console)
         return
 
 
