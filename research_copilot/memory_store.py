@@ -2,12 +2,15 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 try:
     from .agent_state import AgentState
+    from .failure_taxonomy import summarize_failure_pattern
 except ImportError:  # pragma: no cover - fallback for direct script execution
     from agent_state import AgentState
+    from failure_taxonomy import summarize_failure_pattern
 
 
 def store_memory(state: AgentState, key: str, value: Any) -> None:
@@ -65,3 +68,67 @@ def record_experiment_memory(state: AgentState, run_result: dict, parsed_results
 
     if run_result.get("results_path"):
         store_memory(state, "run_experiment_output_path", run_result.get("results_path"))
+
+
+def store_circuit_breaker_state(state: AgentState, action: str, breaker_state: dict) -> None:
+    """Store latest circuit breaker state for one action."""
+    states = load_memory(state, "circuit_breakers", {})
+    if not isinstance(states, dict):
+        states = {}
+    states[action] = breaker_state
+    store_memory(state, "circuit_breakers", states)
+
+
+def record_repair_decision(state: AgentState, failed_action: str, failure_info: dict, strategy: dict) -> None:
+    """Store a structured repair decision with failure taxonomy context."""
+    taxonomy = load_memory(state, "failure_taxonomy_by_action", {})
+    if not isinstance(taxonomy, dict):
+        taxonomy = {}
+
+    action_failures = taxonomy.get(failed_action, [])
+    if not isinstance(action_failures, list):
+        action_failures = []
+    action_failures.append(failure_info)
+    taxonomy[failed_action] = action_failures[-10:]
+    store_memory(state, "failure_taxonomy_by_action", taxonomy)
+
+    recent_failures = load_memory(state, "recent_failures", [])
+    if not isinstance(recent_failures, list):
+        recent_failures = []
+    recent_event = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "action": failed_action,
+        **failure_info,
+    }
+    recent_failures.append(recent_event)
+    recent_failures = recent_failures[-20:]
+    store_memory(state, "recent_failures", recent_failures)
+    store_memory(state, "recent_failure_summary", summarize_failure_pattern(recent_failures))
+
+    repair_history = load_memory(state, "repair_history", [])
+    if not isinstance(repair_history, list):
+        repair_history = []
+    decision = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "failed_action": failed_action,
+        "failure_info": failure_info,
+        "strategy": strategy,
+    }
+    repair_history.append(decision)
+    store_memory(state, "repair_history", repair_history[-20:])
+    store_memory(state, "last_repair_decision", decision)
+    store_memory(state, "last_repair_strategy", strategy.get("strategy"))
+
+    if str(strategy.get("strategy")) == "stop_early":
+        store_memory(state, "partial_result", True)
+        store_memory(state, "stop_early_requested", True)
+
+    if str(strategy.get("strategy")) in {"reroute", "replan"}:
+        known_bad = load_memory(state, "known_bad_actions", {})
+        if not isinstance(known_bad, dict):
+            known_bad = {}
+        known_bad[failed_action] = {
+            "reason": failure_info.get("reason", ""),
+            "category": failure_info.get("category", "unknown"),
+        }
+        store_memory(state, "known_bad_actions", known_bad)

@@ -7,17 +7,39 @@ import re
 
 try:
     from .agent_state import AgentAction, AgentState
+    from .circuit_breaker import CircuitBreaker
     from .config import Config
     from .critic import evaluate_state
-    from .memory_store import load_memory, record_experiment_memory, store_memory, summarize_memory
+    from .failure_taxonomy import classify_failure, summarize_failure_pattern
+    from .memory_store import (
+        load_memory,
+        record_experiment_memory,
+        record_repair_decision,
+        store_circuit_breaker_state,
+        store_memory,
+        summarize_memory,
+    )
+    from .persistent_memory import append_lesson, append_run_history, load_lessons
     from .planner import plan_next_step
+    from .repair_policy import build_repair_lesson, choose_repair_strategy
     from .utils import load_from_json, save_json_data, save_report, save_to_json
 except ImportError:  # pragma: no cover - fallback for direct script execution
     from agent_state import AgentAction, AgentState
+    from circuit_breaker import CircuitBreaker
     from config import Config
     from critic import evaluate_state
-    from memory_store import load_memory, record_experiment_memory, store_memory, summarize_memory
+    from failure_taxonomy import classify_failure, summarize_failure_pattern
+    from memory_store import (
+        load_memory,
+        record_experiment_memory,
+        record_repair_decision,
+        store_circuit_breaker_state,
+        store_memory,
+        summarize_memory,
+    )
+    from persistent_memory import append_lesson, append_run_history, load_lessons
     from planner import plan_next_step
+    from repair_policy import build_repair_lesson, choose_repair_strategy
     from utils import load_from_json, save_json_data, save_report, save_to_json
 
 
@@ -71,6 +93,91 @@ def _safe_float(value: str | None, default: float) -> float:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _load_circuit_breaker(state: AgentState, action: str) -> CircuitBreaker:
+    """Load one action circuit breaker from memory."""
+    states = load_memory(state, "circuit_breakers", {})
+    if not isinstance(states, dict):
+        return CircuitBreaker()
+
+    row = states.get(action, {})
+    if not isinstance(row, dict):
+        return CircuitBreaker()
+
+    return CircuitBreaker(
+        failure_threshold=int(row.get("failure_threshold", 3) or 3),
+        recovery_timeout_seconds=int(row.get("recovery_timeout_seconds", 300) or 300),
+        failure_count=int(row.get("failure_count", 0) or 0),
+        last_failure_ts=row.get("last_failure_ts"),
+        state=str(row.get("state", "closed") or "closed"),
+    )
+
+
+def _save_circuit_breaker(state: AgentState, action: str, breaker: CircuitBreaker) -> None:
+    """Persist one action circuit breaker state to memory."""
+    store_circuit_breaker_state(state, action, breaker.to_dict())
+
+
+def _increment_failed_count(state: AgentState, action: str) -> int:
+    """Increase and return failed attempt count for an action."""
+    failed_counts = load_memory(state, "failed_action_counts", {})
+    if not isinstance(failed_counts, dict):
+        failed_counts = {}
+    current_value = int(failed_counts.get(action, 0) or 0) + 1
+    failed_counts[action] = current_value
+    store_memory(state, "failed_action_counts", failed_counts)
+    return current_value
+
+
+def _clear_failed_count(state: AgentState, action: str) -> None:
+    """Reset failed attempt count for an action after success."""
+    failed_counts = load_memory(state, "failed_action_counts", {})
+    if not isinstance(failed_counts, dict):
+        failed_counts = {}
+    failed_counts[action] = 0
+    store_memory(state, "failed_action_counts", failed_counts)
+
+
+def _record_failure_and_repair(
+    state: AgentState,
+    action: str,
+    input_text: str,
+    reason: str,
+    error_message: str,
+    breaker: CircuitBreaker,
+) -> str:
+    """Record one failure, classify it, and persist repair strategy decisions."""
+    record_action(state, action, input_text, reason, "failed")
+    state.last_result = error_message
+    store_memory(state, "last_error", error_message)
+    _increment_failed_count(state, action)
+
+    failure_info = classify_failure(error_message, action)
+    strategy = choose_repair_strategy(state, action, error_message, failure_info)
+    record_repair_decision(state, action, failure_info, strategy)
+
+    breaker.record_failure()
+    _save_circuit_breaker(state, action, breaker)
+
+    try:
+        lesson = build_repair_lesson(state.topic, action, strategy, failure_info)
+        append_lesson(lesson)
+        store_memory(state, "last_repair_lesson", lesson)
+    except Exception:
+        # Persistent lesson write failures should never stop the agent.
+        pass
+
+    recent_failures = load_memory(state, "recent_failures", [])
+    if isinstance(recent_failures, list):
+        store_memory(state, "failure_summary", summarize_failure_pattern(recent_failures))
+
+    repair_message = (
+        f"{error_message} "
+        f"[category={failure_info.get('category', 'unknown')}, strategy={strategy.get('strategy', 'retry_same')}]"
+    )
+    state.last_result = repair_message
+    return repair_message
 
 
 def _fetch_with_source(topic: str, source: str, max_results: int) -> tuple[list, str]:
@@ -382,35 +489,52 @@ def record_action(state: AgentState, action: str, input_text: str, reason: str, 
 
 def safe_execute(state: AgentState, action: str, input_text: str, reason: str, provider: str, model: str) -> str:
     """Execute an action safely and record success/failure details."""
+    breaker = _load_circuit_breaker(state, action)
+    if not breaker.can_execute():
+        _save_circuit_breaker(state, action, breaker)
+        message = f"{action} skipped: circuit breaker is open."
+        record_action(state, action, input_text, reason, "skipped")
+        state.last_result = message
+        store_memory(state, "last_error", message)
+        return message
+
+    _save_circuit_breaker(state, action, breaker)
+
     try:
         result = execute_action(state, action, input_text, provider, model)
         if action == "run_experiment" and not bool(load_memory(state, "experiment_success", False)):
-            record_action(state, action, input_text, reason, "failed")
-            state.last_result = result
-            store_memory(state, "last_error", result)
-            failed_counts = load_memory(state, "failed_action_counts", {})
-            if not isinstance(failed_counts, dict):
-                failed_counts = {}
-            failed_counts[action] = failed_counts.get(action, 0) + 1
-            store_memory(state, "failed_action_counts", failed_counts)
-            return result
+            return _record_failure_and_repair(
+                state=state,
+                action=action,
+                input_text=input_text,
+                reason=reason,
+                error_message=result,
+                breaker=breaker,
+            )
 
         record_action(state, action, input_text, reason, "completed")
         state.last_result = result
         store_memory(state, "last_success_action", action)
+        breaker.record_success()
+        _save_circuit_breaker(state, action, breaker)
+        _clear_failed_count(state, action)
+
+        known_bad = load_memory(state, "known_bad_actions", {})
+        if isinstance(known_bad, dict) and action in known_bad:
+            known_bad.pop(action, None)
+            store_memory(state, "known_bad_actions", known_bad)
+
         return result
     except Exception as error:  # pragma: no cover - runtime safety path
         error_message = f"{action} failed: {error}"
-        record_action(state, action, input_text, reason, "failed")
-        state.last_result = error_message
-        store_memory(state, "last_error", error_message)
-
-        failed_counts = load_memory(state, "failed_action_counts", {})
-        if not isinstance(failed_counts, dict):
-            failed_counts = {}
-        failed_counts[action] = failed_counts.get(action, 0) + 1
-        store_memory(state, "failed_action_counts", failed_counts)
-        return error_message
+        return _record_failure_and_repair(
+            state=state,
+            action=action,
+            input_text=input_text,
+            reason=reason,
+            error_message=error_message,
+            breaker=breaker,
+        )
 
 
 def _final_output_paths(state: AgentState) -> dict[str, str]:
@@ -459,6 +583,7 @@ def run_agent(topic: str, provider: str, model: str, max_iterations: int = DEFAU
     )
     store_memory(state, "provider", provider)
     store_memory(state, "model", model)
+    store_memory(state, "persistent_lessons", load_lessons(limit=5))
 
     while state.iteration < state.max_iterations and not state.done:
         state.iteration += 1
@@ -484,13 +609,43 @@ def run_agent(topic: str, provider: str, model: str, max_iterations: int = DEFAU
 
     final_paths = _final_output_paths(state)
     store_memory(state, "final_output_paths", final_paths)
+    recent_failures = load_memory(state, "recent_failures", [])
+    failure_summary = summarize_failure_pattern(recent_failures) if isinstance(recent_failures, list) else "No failures."
+    repair_history = load_memory(state, "repair_history", [])
+    if isinstance(repair_history, list) and repair_history:
+        recent_repairs = repair_history[-3:]
+        repair_summary = "; ".join(
+            f"{item.get('failed_action')}->{item.get('strategy', {}).get('strategy')}"
+            for item in recent_repairs
+            if isinstance(item, dict)
+        )
+    else:
+        repair_summary = "No repair actions recorded."
+    partial_result = bool(load_memory(state, "partial_result", False)) or (not state.done and bool(final_paths))
+    circuit_breakers = load_memory(state, "circuit_breakers", {})
+    recent_failures_payload = recent_failures[-20:] if isinstance(recent_failures, list) else []
+    repair_history_payload = repair_history[-20:] if isinstance(repair_history, list) else []
     memory_summary = summarize_memory(state)
 
-    return {
+    final_payload = {
         "topic": state.topic,
         "done": state.done,
         "iterations": state.iteration,
         "history": [item.to_dict() for item in state.history],
         "memory_summary": memory_summary,
         "final_output_paths": final_paths,
+        "repair_summary": repair_summary,
+        "partial_result": partial_result,
+        "failure_summary": failure_summary,
+        "circuit_breakers": circuit_breakers if isinstance(circuit_breakers, dict) else {},
+        "recent_failures": recent_failures_payload,
+        "repair_history": repair_history_payload,
     }
+
+    try:
+        append_run_history(final_payload)
+    except Exception:
+        # Run history persistence should not break core execution.
+        pass
+
+    return final_payload

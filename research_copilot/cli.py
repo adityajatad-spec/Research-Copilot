@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
+from datetime import date
 
 from rich.console import Console
 from rich.markdown import Markdown
@@ -14,6 +16,7 @@ try:
     from .eval_harness import safe_run_benchmark
     from .fetcher import fetch_papers
     from .models import ExperimentPlan, HypothesisItem, Paper
+    from .persistent_memory import load_run_history
     from .reporter import generate_report
     from .utils import display_papers, load_from_json, save_json_data, save_report, save_to_json
 except ImportError:  # pragma: no cover - fallback for direct script execution
@@ -21,6 +24,7 @@ except ImportError:  # pragma: no cover - fallback for direct script execution
     from eval_harness import safe_run_benchmark
     from fetcher import fetch_papers
     from models import ExperimentPlan, HypothesisItem, Paper
+    from persistent_memory import load_run_history
     from reporter import generate_report
     from utils import display_papers, load_from_json, save_json_data, save_report, save_to_json
 
@@ -58,6 +62,8 @@ DEFAULT_RUN_EXPERIMENT_SUMMARY_PATH = "output/experiment_run_summary.json"
 DEFAULT_AGENT_OUTPUT_PATH = "output/agent_run.json"
 DEFAULT_AGENT_MAX_ITERATIONS = 6
 DEFAULT_BENCHMARK_OUTPUT_DIR = "output/evals"
+DEFAULT_REPAIR_REPORT_OUTPUT = "output/repair_report.json"
+DEFAULT_REPAIR_REPORT_LIMIT = 10
 DEFAULT_PROVIDER = "ollama"
 DEFAULT_MODEL = "llama3.2"
 EMPTY_TOPIC_MESSAGE = "Please provide a non-empty research topic."
@@ -88,6 +94,7 @@ AGENT_RUN_ERROR = "Agent run failed: {error}"
 AGENT_PRINT_ERROR = "Could not render agent run summary: {error}"
 BENCHMARK_RUN_ERROR = "Benchmark run failed: {error}"
 BENCHMARK_PRINT_ERROR = "Could not render benchmark summary: {error}"
+REPAIR_REPORT_PRINT_ERROR = "Could not render repair report summary: {error}"
 
 
 def _truncate(text: str, limit: int = TITLE_LIMIT) -> str:
@@ -457,6 +464,23 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="print_benchmark",
         help="Print aggregate metrics and per-task score rows",
+    )
+
+    repair_report_parser = subparsers.add_parser(
+        "repair-report",
+        help="Summarize common failures and repair strategies from recent agent runs",
+    )
+    repair_report_parser.add_argument(
+        "--limit",
+        type=int,
+        default=DEFAULT_REPAIR_REPORT_LIMIT,
+        help="Number of recent runs to include in the repair report",
+    )
+    repair_report_parser.add_argument(
+        "--print",
+        action="store_true",
+        dest="print_repair_report",
+        help="Print a readable repair summary table in the terminal",
     )
 
     return parser
@@ -1041,6 +1065,7 @@ def _display_agent_run_summary(run_result: dict, console: Console) -> None:
     overview.add_row("Topic", str(run_result.get("topic", "")))
     overview.add_row("Done", str(run_result.get("done", False)))
     overview.add_row("Iterations", str(run_result.get("iterations", 0)))
+    overview.add_row("Partial Result", str(run_result.get("partial_result", False)))
     console.print(overview)
 
     history = run_result.get("history", [])
@@ -1068,6 +1093,11 @@ def _display_agent_run_summary(run_result: dict, console: Console) -> None:
     memory_summary = str(run_result.get("memory_summary", "No memory summary available."))
     console.print(Panel.fit(memory_summary, title="Memory Summary", border_style="green"))
 
+    failure_summary = str(run_result.get("failure_summary", "No failure summary available."))
+    repair_summary = str(run_result.get("repair_summary", "No repair summary available."))
+    console.print(Panel.fit(failure_summary, title="Failure Summary", border_style="red"))
+    console.print(Panel.fit(repair_summary, title="Repair Summary", border_style="yellow"))
+
     output_paths = run_result.get("final_output_paths", {})
     paths_table = Table(title="Output Paths", show_header=True, header_style="bold magenta")
     paths_table.add_column("Artifact")
@@ -1092,16 +1122,22 @@ def _display_benchmark_summary(result: dict, console: Console) -> None:
     aggregate_table.add_row("Avg Artifact Score", str(aggregate.get("average_artifact_score", 0.0)))
     aggregate_table.add_row("Avg Iteration Score", str(aggregate.get("average_iteration_score", 0.0)))
     aggregate_table.add_row("Avg Experiment Score", str(aggregate.get("average_experiment_score", 0.0)))
+    aggregate_table.add_row("Partial Result Count", str(aggregate.get("partial_result_count", 0)))
     aggregate_table.add_row("Best Task", str(aggregate.get("best_task", "")))
     aggregate_table.add_row("Worst Task", str(aggregate.get("worst_task", "")))
+    failure_prone_tasks = aggregate.get("failure_prone_tasks", [])
+    if isinstance(failure_prone_tasks, list):
+        aggregate_table.add_row("Failure-Prone Tasks", ", ".join(str(item) for item in failure_prone_tasks) or "-")
     console.print(aggregate_table)
 
     task_table = Table(title="Benchmark Tasks", show_header=True, header_style="bold cyan")
     task_table.add_column("Topic", overflow="fold")
     task_table.add_column("Completed", width=10)
+    task_table.add_column("Partial", width=8)
     task_table.add_column("Total", width=8, justify="right")
     task_table.add_column("Artifacts", width=10, justify="right")
     task_table.add_column("Iterations", width=10, justify="right")
+    task_table.add_column("Repair Summary", overflow="fold")
 
     for row in result.get("scores", []):
         if not isinstance(row, dict):
@@ -1109,9 +1145,11 @@ def _display_benchmark_summary(result: dict, console: Console) -> None:
         task_table.add_row(
             _truncate(str(row.get("topic", "")), limit=45),
             str(row.get("completed", False)),
+            str(row.get("partial_result", False)),
             str(row.get("total_score", 0.0)),
             str(row.get("artifact_score", 0.0)),
             str(row.get("iterations", 0)),
+            _truncate(str(row.get("repair_summary", "")), limit=70),
         )
 
     console.print(task_table)
@@ -1204,6 +1242,162 @@ def _run_benchmark(args: argparse.Namespace, console: Console) -> None:
             console.print(f"[yellow]{BENCHMARK_PRINT_ERROR.format(error=error)}[/yellow]")
 
 
+def _top_counter_rows(counter: Counter[str], label_key: str, limit: int = 5) -> list[dict]:
+    """Convert a counter into top-N dictionaries."""
+    rows: list[dict] = []
+    for key, count in counter.most_common(limit):
+        rows.append({label_key: key, "count": count})
+    return rows
+
+
+def _build_repair_report(limit: int) -> dict:
+    """Build a repair summary report from recent persistent run history."""
+    bounded_limit = limit if limit > 0 else DEFAULT_REPAIR_REPORT_LIMIT
+    runs = load_run_history(limit=bounded_limit)
+
+    failure_categories: Counter[str] = Counter()
+    repair_strategies: Counter[str] = Counter()
+    failing_actions: Counter[str] = Counter()
+    partial_result_topics: list[str] = []
+    recent_runs: list[dict] = []
+
+    for run in runs:
+        if not isinstance(run, dict):
+            continue
+
+        topic = str(run.get("topic", "")).strip()
+        if bool(run.get("partial_result")) and topic:
+            partial_result_topics.append(topic)
+
+        history = run.get("history", [])
+        if isinstance(history, list):
+            for item in history:
+                if not isinstance(item, dict):
+                    continue
+                if str(item.get("status", "")) == "failed":
+                    action = str(item.get("action", "")).strip()
+                    if action:
+                        failing_actions[action] += 1
+
+        recent_failures = run.get("recent_failures", [])
+        if isinstance(recent_failures, list):
+            for failure in recent_failures:
+                if not isinstance(failure, dict):
+                    continue
+                category = str(failure.get("category", "")).strip()
+                if category:
+                    failure_categories[category] += 1
+
+        repair_history = run.get("repair_history", [])
+        if isinstance(repair_history, list):
+            for repair in repair_history:
+                if not isinstance(repair, dict):
+                    continue
+                strategy = repair.get("strategy", {})
+                if isinstance(strategy, dict):
+                    strategy_name = str(strategy.get("strategy", "")).strip()
+                    if strategy_name:
+                        repair_strategies[strategy_name] += 1
+
+        recent_runs.append(
+            {
+                "topic": topic,
+                "done": bool(run.get("done", False)),
+                "iterations": int(run.get("iterations", 0) or 0),
+                "partial_result": bool(run.get("partial_result", False)),
+                "failure_summary": str(run.get("failure_summary", "")),
+                "repair_summary": str(run.get("repair_summary", "")),
+            }
+        )
+
+    return {
+        "generated_at": date.today().isoformat(),
+        "run_count": len([row for row in runs if isinstance(row, dict)]),
+        "common_failure_categories": _top_counter_rows(failure_categories, "category"),
+        "common_repair_strategies": _top_counter_rows(repair_strategies, "strategy"),
+        "partial_result_topics": partial_result_topics,
+        "most_frequent_failing_actions": _top_counter_rows(failing_actions, "action"),
+        "recent_runs": recent_runs[-bounded_limit:],
+    }
+
+
+def _display_repair_report(report: dict, console: Console) -> None:
+    """Render a repair report summary in rich tables."""
+    overview = Table(show_header=False, box=None)
+    overview.add_row("Generated At", str(report.get("generated_at", "")))
+    overview.add_row("Run Count", str(report.get("run_count", 0)))
+    overview.add_row("Partial Result Topics", str(len(report.get("partial_result_topics", []))))
+    console.print(overview)
+
+    category_table = Table(title="Common Failure Categories", show_header=True, header_style="bold red")
+    category_table.add_column("Category")
+    category_table.add_column("Count", justify="right")
+    categories = report.get("common_failure_categories", [])
+    if isinstance(categories, list) and categories:
+        for row in categories:
+            if not isinstance(row, dict):
+                continue
+            category_table.add_row(str(row.get("category", "")), str(row.get("count", 0)))
+    else:
+        category_table.add_row("-", "0")
+    console.print(category_table)
+
+    strategy_table = Table(title="Common Repair Strategies", show_header=True, header_style="bold yellow")
+    strategy_table.add_column("Strategy")
+    strategy_table.add_column("Count", justify="right")
+    strategies = report.get("common_repair_strategies", [])
+    if isinstance(strategies, list) and strategies:
+        for row in strategies:
+            if not isinstance(row, dict):
+                continue
+            strategy_table.add_row(str(row.get("strategy", "")), str(row.get("count", 0)))
+    else:
+        strategy_table.add_row("-", "0")
+    console.print(strategy_table)
+
+    action_table = Table(title="Most Frequent Failing Actions", show_header=True, header_style="bold magenta")
+    action_table.add_column("Action")
+    action_table.add_column("Count", justify="right")
+    actions = report.get("most_frequent_failing_actions", [])
+    if isinstance(actions, list) and actions:
+        for row in actions:
+            if not isinstance(row, dict):
+                continue
+            action_table.add_row(str(row.get("action", "")), str(row.get("count", 0)))
+    else:
+        action_table.add_row("-", "0")
+    console.print(action_table)
+
+    partial_topics = report.get("partial_result_topics", [])
+    if isinstance(partial_topics, list) and partial_topics:
+        lines = "\n".join(f"- {topic}" for topic in partial_topics)
+    else:
+        lines = "No partial-result topics in recent runs."
+    console.print(Panel.fit(lines, title="Partial Results", border_style="cyan"))
+
+
+def _run_repair_report(args: argparse.Namespace, console: Console) -> None:
+    """Run the repair-report subcommand."""
+    limit_value = args.limit if args.limit and args.limit > 0 else DEFAULT_REPAIR_REPORT_LIMIT
+    banner = Panel.fit(
+        f"[bold]Limit:[/bold] {limit_value}\n"
+        f"[bold]Output:[/bold] {DEFAULT_REPAIR_REPORT_OUTPUT}",
+        title=f"{APP_NAME} Repair Report",
+        border_style="bright_yellow",
+    )
+    console.print(banner)
+
+    report = _build_repair_report(limit_value)
+    save_json_data(report, DEFAULT_REPAIR_REPORT_OUTPUT)
+    console.print(f"[green]{SAVE_SUCCESS_MESSAGE.format(filepath=DEFAULT_REPAIR_REPORT_OUTPUT)}[/green]")
+
+    if args.print_repair_report:
+        try:
+            _display_repair_report(report, console)
+        except Exception as error:
+            console.print(f"[yellow]{REPAIR_REPORT_PRINT_ERROR.format(error=error)}[/yellow]")
+
+
 def main() -> None:
     """Run the AI Research Copilot CLI."""
     parser = _build_parser()
@@ -1252,6 +1446,10 @@ def main() -> None:
 
     if args.command == "benchmark":
         _run_benchmark(args, console)
+        return
+
+    if args.command == "repair-report":
+        _run_repair_report(args, console)
         return
 
 

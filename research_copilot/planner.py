@@ -9,10 +9,12 @@ try:
     from .agent_state import AgentState
     from .config import Config, get_client, validate_provider_setup
     from .memory_store import summarize_memory
+    from .persistent_memory import load_lessons
 except ImportError:  # pragma: no cover - fallback for direct script execution
     from agent_state import AgentState
     from config import Config, get_client, validate_provider_setup
     from memory_store import summarize_memory
+    from persistent_memory import load_lessons
 
 
 PLANNER_ACTIONS = [
@@ -74,11 +76,40 @@ def _artifact_exists(state: AgentState, action: str) -> bool:
     return False
 
 
+def _circuit_state(state: AgentState, action: str) -> str:
+    """Return circuit breaker state for one action."""
+    breakers = state.memory.get("circuit_breakers", {})
+    if isinstance(breakers, dict):
+        row = breakers.get(action, {})
+        if isinstance(row, dict):
+            value = str(row.get("state", "closed")).strip().lower()
+            if value in {"closed", "open", "half_open"}:
+                return value
+    return "closed"
+
+
+def _action_is_blocked(state: AgentState, action: str) -> bool:
+    """Return whether planner should avoid an action right now."""
+    if _circuit_state(state, action) == "open":
+        return True
+
+    known_bad = state.memory.get("known_bad_actions", {})
+    if not isinstance(known_bad, dict):
+        return False
+
+    if action not in known_bad:
+        return False
+    return _circuit_state(state, action) == "open"
+
+
 def _next_missing_action(state: AgentState) -> str:
     """Return the next missing action in preferred pipeline order."""
     for action in ACTION_ORDER:
-        if not _artifact_exists(state, action):
-            return action
+        if _artifact_exists(state, action):
+            continue
+        if _action_is_blocked(state, action):
+            continue
+        return action
     return "finish"
 
 
@@ -111,27 +142,38 @@ def _default_input_for(action: str, state: AgentState) -> str:
     return ""
 
 
-def _strategy_change_action(action: str) -> str:
+def _strategy_change_action(action: str, state: AgentState) -> str:
     """Choose an alternate action when repeated failures occur."""
-    if action == "fetch":
-        return "pdf"
-    if action == "pdf":
-        return "summarize"
-    if action == "summarize":
-        return "report"
-    if action == "report":
-        return "insights"
-    if action == "insights":
-        return "gaps"
-    if action == "gaps":
-        return "hypotheses"
-    if action == "hypotheses":
-        return "experiment"
-    if action == "experiment":
-        return "run_experiment"
-    if action == "run_experiment":
-        return "finish"
+    if action not in ACTION_ORDER:
+        return _next_missing_action(state)
+
+    index = ACTION_ORDER.index(action)
+    for candidate in ACTION_ORDER[index + 1 :]:
+        if _action_is_blocked(state, candidate):
+            continue
+        return candidate
     return "finish"
+
+
+def _repair_override_action(state: AgentState) -> str | None:
+    """Return a planner action suggested by the latest repair decision."""
+    decision = state.memory.get("last_repair_decision", {})
+    if not isinstance(decision, dict):
+        return None
+
+    strategy = decision.get("strategy", {})
+    if not isinstance(strategy, dict):
+        return None
+
+    strategy_name = str(strategy.get("strategy", "")).strip()
+    suggested = str(strategy.get("next_action", "")).strip().lower()
+
+    if strategy_name == "stop_early":
+        return "finish"
+
+    if suggested in PLANNER_ACTIONS and not _action_is_blocked(state, suggested):
+        return suggested
+    return None
 
 
 def _apply_failure_guard(plan: dict, state: AgentState) -> dict:
@@ -141,14 +183,30 @@ def _apply_failure_guard(plan: dict, state: AgentState) -> dict:
     if action not in PLANNER_ACTIONS:
         return fallback_plan(state)
 
-    last_action = state.history[-1] if state.history else None
-    failed_twice = failed_counts.get(action, 0) >= 2
-    immediate_repeat_failure = bool(
-        last_action and last_action.action == action and last_action.status == "failed" and failed_counts.get(action, 0) >= 2
-    )
+    if _action_is_blocked(state, action):
+        alternative = _strategy_change_action(action, state)
+        return {
+            "thought": f"Skipping '{action}' because its circuit breaker is open.",
+            "action": alternative,
+            "input": _default_input_for(alternative, state),
+        }
 
-    if failed_twice or immediate_repeat_failure:
-        alternative = _strategy_change_action(action)
+    last_action = state.history[-1] if state.history else None
+    immediate_repeat_failure = bool(
+        last_action and last_action.action == action and last_action.status == "failed"
+    )
+    failed_twice = failed_counts.get(action, 0) >= 2
+
+    if immediate_repeat_failure and failed_counts.get(action, 0) >= 1:
+        alternative = _strategy_change_action(action, state)
+        return {
+            "thought": f"Avoiding immediate retry of '{action}' after failure.",
+            "action": alternative,
+            "input": _default_input_for(alternative, state),
+        }
+
+    if failed_twice:
+        alternative = _strategy_change_action(action, state)
         return {
             "thought": f"Changing strategy because '{action}' failed repeatedly.",
             "action": alternative,
@@ -158,13 +216,29 @@ def _apply_failure_guard(plan: dict, state: AgentState) -> dict:
     return plan
 
 
+def _recent_lessons(topic: str, limit: int = 3) -> list[dict]:
+    """Load recent persistent lessons relevant to a topic."""
+    lessons = load_lessons(limit=limit * 3)
+    if not lessons:
+        return []
+
+    topic_lower = topic.strip().lower()
+    filtered: list[dict] = []
+    for lesson in lessons:
+        lesson_topic = str(lesson.get("topic", "")).strip().lower()
+        if topic_lower and lesson_topic and lesson_topic != topic_lower:
+            continue
+        filtered.append(lesson)
+    return filtered[-limit:]
+
+
 def generate_planner_prompt(state: AgentState) -> tuple[str, str]:
     """Generate planner system and user prompts with JSON-only instructions."""
     system_prompt = (
         "You are a planning module for an autonomous research pipeline.\n"
         "Return ONLY valid JSON with keys: thought, action, input.\n"
         "Allowed actions: fetch, pdf, summarize, report, insights, gaps, hypotheses, experiment, run_experiment, finish.\n"
-        "Choose the minimum next step needed. Avoid repeating failed actions."
+        "Use recent failures, repair advice, and circuit breaker hints. Avoid repeating failed actions."
     )
 
     history_lines = [
@@ -172,11 +246,21 @@ def generate_planner_prompt(state: AgentState) -> tuple[str, str]:
     ]
     history_text = "\n".join(history_lines) if history_lines else "- none"
 
+    recent_failures = str(state.memory.get("recent_failure_summary", "No recent failures."))
+    repair_advice = state.memory.get("last_repair_decision", {})
+    repair_text = json.dumps(repair_advice) if isinstance(repair_advice, dict) else "none"
+    circuit_hints = json.dumps(state.memory.get("circuit_breakers", {}))
+    lesson_text = json.dumps(_recent_lessons(state.topic))
+
     user_prompt = (
         f"Topic: {state.topic}\n"
         f"Iteration: {state.iteration}/{state.max_iterations}\n"
         f"Current goal: {state.current_goal}\n"
         f"Recent history:\n{history_text}\n"
+        f"Recent failures: {recent_failures}\n"
+        f"Repair advice: {repair_text}\n"
+        f"Circuit hints: {circuit_hints}\n"
+        f"Relevant persistent lessons: {lesson_text}\n"
         f"Memory summary: {summarize_memory(state)}\n"
         "Return JSON only."
     )
@@ -185,13 +269,28 @@ def generate_planner_prompt(state: AgentState) -> tuple[str, str]:
 
 def fallback_plan(state: AgentState) -> dict:
     """Return a safe deterministic plan when planner output is unavailable."""
+    if bool(state.memory.get("stop_early_requested")):
+        return {
+            "thought": "Repair strategy requested early stop with partial outputs.",
+            "action": "finish",
+            "input": "",
+        }
+
+    repair_action = _repair_override_action(state)
+    if repair_action is not None:
+        return {
+            "thought": "Following latest repair strategy recommendation.",
+            "action": repair_action,
+            "input": _default_input_for(repair_action, state),
+        }
+
     next_action = _next_missing_action(state)
     if next_action == "finish":
-        return {"thought": "All expected artifacts are present.", "action": "finish", "input": ""}
+        return {"thought": "All expected artifacts are present or blocked.", "action": "finish", "input": ""}
 
     failed_counts = _failed_counts(state)
     if failed_counts.get(next_action, 0) >= 2:
-        alternative = _strategy_change_action(next_action)
+        alternative = _strategy_change_action(next_action, state)
         return {
             "thought": f"Switching from '{next_action}' after repeated failures.",
             "action": alternative,

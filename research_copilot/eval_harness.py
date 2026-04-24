@@ -44,6 +44,8 @@ def write_scores_csv(results: list[dict], filepath: str) -> None:
         "iteration_score",
         "experiment_score",
         "iterations",
+        "partial_result",
+        "failure_count",
         "notes",
     ]
 
@@ -67,9 +69,43 @@ def write_scores_csv(results: list[dict], filepath: str) -> None:
                     "iteration_score": row.get("iteration_score", 0.0),
                     "experiment_score": row.get("experiment_score", 0.0),
                     "iterations": row.get("iterations", 0),
+                    "partial_result": row.get("partial_result", False),
+                    "failure_count": row.get("failure_count", 0),
                     "notes": notes_text,
                 }
             )
+
+
+def _history_failure_count(run_data: dict) -> int:
+    """Return failed action count from run history."""
+    history = run_data.get("history", [])
+    if not isinstance(history, list):
+        return 0
+    return sum(1 for item in history if isinstance(item, dict) and str(item.get("status", "")) == "failed")
+
+
+def _failure_prone_tasks(score_rows: list[dict]) -> list[str]:
+    """Return top failure-prone task ids based on failures and score."""
+    ranked = sorted(
+        score_rows,
+        key=lambda row: (
+            -int(row.get("failure_count", 0) or 0),
+            float(row.get("total_score", 0.0)),
+        ),
+    )
+    picked: list[str] = []
+    for row in ranked:
+        task_id = str(row.get("task_id", "")).strip()
+        failure_count = int(row.get("failure_count", 0) or 0)
+        total_score = float(row.get("total_score", 0.0) or 0.0)
+        if not task_id:
+            continue
+        if failure_count <= 0 and total_score >= 0.6:
+            continue
+        picked.append(task_id)
+        if len(picked) >= 3:
+            break
+    return picked
 
 
 def run_benchmark(
@@ -119,6 +155,15 @@ def run_benchmark(
         run_output_path.write_text(json.dumps(run_data, indent=2), encoding="utf-8")
 
         score_row = score_agent_run(task, run_data)
+        score_row["failure_summary"] = str(run_data.get("failure_summary", ""))
+        score_row["repair_summary"] = str(run_data.get("repair_summary", ""))
+        score_row["partial_result"] = bool(run_data.get("partial_result", False))
+        score_row["failure_count"] = _history_failure_count(run_data)
+        if score_row["partial_result"]:
+            notes = score_row.get("notes", [])
+            if isinstance(notes, list):
+                notes.append("Run ended with partial_result=True.")
+                score_row["notes"] = notes
         score_rows.append(score_row)
         run_rows.append(
             {
@@ -130,6 +175,8 @@ def run_benchmark(
         )
 
     aggregate = aggregate_scores(score_rows)
+    aggregate["partial_result_count"] = sum(1 for row in score_rows if bool(row.get("partial_result")))
+    aggregate["failure_prone_tasks"] = _failure_prone_tasks(score_rows)
 
     benchmark_results_path = output_root / "benchmark_results.json"
     benchmark_scores_csv_path = output_root / "benchmark_scores.csv"
@@ -188,6 +235,8 @@ def safe_run_benchmark(
                 "average_experiment_score": 0.0,
                 "best_task": "",
                 "worst_task": "",
+                "partial_result_count": 0,
+                "failure_prone_tasks": [],
             },
             "output_paths": {},
         }
