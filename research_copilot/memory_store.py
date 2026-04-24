@@ -156,3 +156,15 @@ def record_planner_snapshot(
 
     store_memory(state, "planner_artifacts", artifacts)
     store_memory(state, "planner_skipped_reasons", skipped_reasons[-10:])
+
+
+def get_last_successful_action(state: AgentState) -> str | None:
+    """Return the latest successful action from memory or history."""
+    memory_value = load_memory(state, "last_success_action")
+    if isinstance(memory_value, str) and memory_value.strip():
+        return memory_value
+
+    for item in reversed(state.history):
+        if item.status == "completed" and item.action.strip():
+            return item.action
+    return None

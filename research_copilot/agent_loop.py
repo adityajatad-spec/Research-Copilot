@@ -17,6 +17,7 @@ try:
     from .memory_store import (
         load_memory,
         record_experiment_memory,
+        record_planner_snapshot,
         record_repair_decision,
         store_circuit_breaker_state,
         store_memory,
@@ -35,6 +36,7 @@ except ImportError:  # pragma: no cover - fallback for direct script execution
     from memory_store import (
         load_memory,
         record_experiment_memory,
+        record_planner_snapshot,
         record_repair_decision,
         store_circuit_breaker_state,
         store_memory,
@@ -690,6 +692,24 @@ def run_agent(
 
         log(f"[agent] Planning complete. Selected action='{action}' reason='{reason}'.")
         store_memory(state, "last_plan", plan)
+        debug_artifacts = plan.get("debug_artifacts", [])
+        debug_skips = plan.get("debug_skips", [])
+        debug_status = plan.get("debug_artifact_status", {})
+
+        if isinstance(debug_artifacts, list) and debug_artifacts:
+            log(f"[agent] Detected existing artifacts: {', '.join(str(item) for item in debug_artifacts)}.")
+
+        if isinstance(debug_skips, list):
+            for item in debug_skips[:5]:
+                log(f"[agent] Planner note: {item}")
+
+        if isinstance(debug_status, dict):
+            record_planner_snapshot(
+                state=state,
+                planned_action=action,
+                artifacts={str(key): bool(value) for key, value in debug_status.items()},
+                skipped_reasons=[str(item) for item in debug_skips] if isinstance(debug_skips, list) else [],
+            )
 
         log(f"[agent] Action selection complete. Next action='{action}'.")
         if action == "finish":
@@ -710,6 +730,20 @@ def run_agent(
             f"status={critic_decision.get('status', 'continue')} "
             f"reason='{critic_decision.get('reason', '')}'."
         )
+
+        detected_artifacts = critic_decision.get("detected_artifacts", {})
+        if isinstance(detected_artifacts, dict) and detected_artifacts:
+            ready = [str(key) for key, value in detected_artifacts.items() if bool(value)]
+            if ready:
+                log(f"[agent] Critic detected artifacts: {', '.join(ready)}.")
+
+        completed_steps = critic_decision.get("completed_steps", [])
+        if isinstance(completed_steps, list) and completed_steps:
+            log(f"[agent] Critic completed steps: {', '.join(str(item) for item in completed_steps)}.")
+
+        next_missing_step = critic_decision.get("next_missing_step")
+        if isinstance(next_missing_step, str) and next_missing_step:
+            log(f"[agent] Critic next missing step: {next_missing_step}.")
 
         if critic_decision.get("status") == "done":
             state.done = True
