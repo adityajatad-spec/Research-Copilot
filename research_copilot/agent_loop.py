@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from pathlib import Path
 import re
+import signal
+from typing import Callable
 
 try:
     from .agent_state import AgentAction, AgentState
@@ -20,7 +23,7 @@ try:
         summarize_memory,
     )
     from .persistent_memory import append_lesson, append_run_history, load_lessons
-    from .planner import plan_next_step
+    from .planner import fallback_plan, plan_next_step
     from .repair_policy import build_repair_lesson, choose_repair_strategy
     from .utils import load_from_json, save_json_data, save_report, save_to_json
 except ImportError:  # pragma: no cover - fallback for direct script execution
@@ -38,7 +41,7 @@ except ImportError:  # pragma: no cover - fallback for direct script execution
         summarize_memory,
     )
     from persistent_memory import append_lesson, append_run_history, load_lessons
-    from planner import plan_next_step
+    from planner import fallback_plan, plan_next_step
     from repair_policy import build_repair_lesson, choose_repair_strategy
     from utils import load_from_json, save_json_data, save_report, save_to_json
 
@@ -65,6 +68,59 @@ DEFAULT_EXPERIMENT_EPOCHS = 1
 DEFAULT_EXPERIMENT_LEARNING_RATE = 1e-4
 DEFAULT_EXPERIMENT_SEED = 42
 DEFAULT_EXPERIMENT_TIMEOUT = 120
+DEFAULT_PLANNING_TIMEOUT_SECONDS = 25
+DEFAULT_ACTION_TIMEOUT_SECONDS = 120
+
+
+class OperationTimeoutError(RuntimeError):
+    """Raised when a bounded operation exceeds its configured timeout."""
+
+
+@contextmanager
+def _time_limit(seconds: int, label: str):
+    """Bound one operation to a wall-clock timeout when supported."""
+    if seconds <= 0 or not hasattr(signal, "SIGALRM"):
+        yield
+        return
+
+    def _handle_timeout(signum, frame):  # type: ignore[no-untyped-def]
+        _ = signum
+        _ = frame
+        raise OperationTimeoutError(f"{label} timed out after {seconds} seconds.")
+
+    previous_handler = signal.getsignal(signal.SIGALRM)
+    signal.signal(signal.SIGALRM, _handle_timeout)
+    signal.setitimer(signal.ITIMER_REAL, float(seconds))
+    try:
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0.0)
+        signal.signal(signal.SIGALRM, previous_handler)
+
+
+def _build_log_fn(log_steps: bool, logger: Callable[[str], None] | None) -> Callable[[str], None]:
+    """Build a lightweight logger callback for run progress messages."""
+    if not log_steps:
+        return lambda message: None
+    if logger is not None:
+        return logger
+    return print
+
+
+def _action_timeout_seconds(action: str, input_text: str) -> int:
+    """Return timeout seconds for one action execution."""
+    params = _parse_params(input_text)
+    if action == "run_experiment":
+        requested_timeout = _safe_int(params.get("timeout"), DEFAULT_EXPERIMENT_TIMEOUT)
+        return max(requested_timeout + 10, DEFAULT_ACTION_TIMEOUT_SECONDS)
+
+    if action in {"summarize", "insights", "gaps", "hypotheses"}:
+        return 90
+
+    if action in {"fetch", "pdf"}:
+        return 60
+
+    return DEFAULT_ACTION_TIMEOUT_SECONDS
 
 
 def _parse_params(input_text: str) -> dict[str, str]:
@@ -499,9 +555,11 @@ def safe_execute(state: AgentState, action: str, input_text: str, reason: str, p
         return message
 
     _save_circuit_breaker(state, action, breaker)
+    timeout_seconds = _action_timeout_seconds(action, input_text)
 
     try:
-        result = execute_action(state, action, input_text, provider, model)
+        with _time_limit(timeout_seconds, f"Action '{action}'"):
+            result = execute_action(state, action, input_text, provider, model)
         if action == "run_experiment" and not bool(load_memory(state, "experiment_success", False)):
             return _record_failure_and_repair(
                 state=state,
@@ -525,6 +583,16 @@ def safe_execute(state: AgentState, action: str, input_text: str, reason: str, p
             store_memory(state, "known_bad_actions", known_bad)
 
         return result
+    except OperationTimeoutError as error:
+        error_message = f"{action} failed: {error}"
+        return _record_failure_and_repair(
+            state=state,
+            action=action,
+            input_text=input_text,
+            reason=reason,
+            error_message=error_message,
+            breaker=breaker,
+        )
     except Exception as error:  # pragma: no cover - runtime safety path
         error_message = f"{action} failed: {error}"
         return _record_failure_and_repair(
@@ -568,10 +636,18 @@ def _final_output_paths(state: AgentState) -> dict[str, str]:
     return paths
 
 
-def run_agent(topic: str, provider: str, model: str, max_iterations: int = DEFAULT_MAX_ITERATIONS) -> dict:
+def run_agent(
+    topic: str,
+    provider: str,
+    model: str,
+    max_iterations: int = DEFAULT_MAX_ITERATIONS,
+    log_steps: bool = False,
+    logger: Callable[[str], None] | None = None,
+) -> dict:
     """Run the autonomous research loop and return a final run summary."""
     bounded_iterations = max(1, min(max_iterations, HARD_MAX_ITERATIONS))
     config = Config(provider=provider, model=model)
+    log = _build_log_fn(log_steps, logger)
 
     state = AgentState(
         topic=topic.strip(),
@@ -587,25 +663,58 @@ def run_agent(topic: str, provider: str, model: str, max_iterations: int = DEFAU
 
     while state.iteration < state.max_iterations and not state.done:
         state.iteration += 1
-        plan = plan_next_step(state, config)
+        log(f"[agent] Iteration {state.iteration}/{state.max_iterations}: planning started.")
+
+        try:
+            with _time_limit(DEFAULT_PLANNING_TIMEOUT_SECONDS, "Planner step"):
+                plan = plan_next_step(state, config)
+        except OperationTimeoutError as error:
+            plan = fallback_plan(state)
+            store_memory(state, "planner_timeout_error", str(error))
+            log(f"[agent] Planner timeout: {error}. Using fallback plan.")
+        except Exception as error:
+            plan = fallback_plan(state)
+            store_memory(state, "planner_error", str(error))
+            log(f"[agent] Planner error: {error}. Using fallback plan.")
+
         action = str(plan.get("action", "finish")).strip().lower()
         reason = str(plan.get("thought", "No planner rationale provided.")).strip()
         input_text = str(plan.get("input", "")).strip()
 
+        if not action:
+            action = "finish"
+            plan = fallback_plan(state)
+            reason = str(plan.get("thought", "Planner returned empty action.")).strip()
+            input_text = str(plan.get("input", "")).strip()
+            log("[agent] Planner returned empty action. Switched to fallback plan.")
+
+        log(f"[agent] Planning complete. Selected action='{action}' reason='{reason}'.")
         store_memory(state, "last_plan", plan)
 
+        log(f"[agent] Action selection complete. Next action='{action}'.")
         if action == "finish":
             record_action(state, action, input_text, reason, "completed")
             state.last_result = "Planner requested completion."
+            log("[agent] Action execution skipped because planner requested finish.")
         else:
-            safe_execute(state, action, input_text, reason, provider, model)
+            log(f"[agent] Action execution started: {action}.")
+            result = safe_execute(state, action, input_text, reason, provider, model)
+            latest_status = state.history[-1].status if state.history else "unknown"
+            log(f"[agent] Action execution finished: {action} status={latest_status} result='{result}'.")
 
+        log("[agent] Critic evaluation started.")
         critic_decision = evaluate_state(state)
         store_memory(state, "last_critic_decision", critic_decision)
+        log(
+            "[agent] Critic evaluation finished: "
+            f"status={critic_decision.get('status', 'continue')} "
+            f"reason='{critic_decision.get('reason', '')}'."
+        )
 
         if critic_decision.get("status") == "done":
             state.done = True
             state.last_result = str(critic_decision.get("reason", state.last_result))
+            log(f"[agent] Loop marked done: {state.last_result}")
 
     final_paths = _final_output_paths(state)
     store_memory(state, "final_output_paths", final_paths)
@@ -647,5 +756,11 @@ def run_agent(topic: str, provider: str, model: str, max_iterations: int = DEFAU
     except Exception:
         # Run history persistence should not break core execution.
         pass
+
+    log(
+        "[agent] Run complete: "
+        f"done={final_payload['done']} iterations={final_payload['iterations']} "
+        f"partial_result={final_payload['partial_result']}."
+    )
 
     return final_payload

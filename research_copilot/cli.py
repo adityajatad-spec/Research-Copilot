@@ -1182,6 +1182,8 @@ def _run_agent(args: argparse.Namespace, console: Console) -> None:
             provider=args.provider,
             model=args.model,
             max_iterations=args.max_iterations,
+            log_steps=True,
+            logger=lambda message: console.print(message, style="cyan", markup=False),
         )
     except Exception as error:
         console.print(f"[yellow]{AGENT_RUN_ERROR.format(error=error)}[/yellow]")

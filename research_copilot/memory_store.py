@@ -132,3 +132,27 @@ def record_repair_decision(state: AgentState, failed_action: str, failure_info: 
             "category": failure_info.get("category", "unknown"),
         }
         store_memory(state, "known_bad_actions", known_bad)
+
+
+def record_planner_snapshot(
+    state: AgentState,
+    planned_action: str,
+    artifacts: dict[str, bool],
+    skipped_reasons: list[str],
+) -> None:
+    """Store planner artifact inspection and progression rationale in memory."""
+    snapshot = {
+        "timestamp": datetime.utcnow().isoformat(),
+        "planned_action": planned_action,
+        "artifacts": artifacts,
+        "skipped_reasons": skipped_reasons,
+    }
+
+    history = load_memory(state, "planner_snapshots", [])
+    if not isinstance(history, list):
+        history = []
+    history.append(snapshot)
+    store_memory(state, "planner_snapshots", history[-25:])
+
+    store_memory(state, "planner_artifacts", artifacts)
+    store_memory(state, "planner_skipped_reasons", skipped_reasons[-10:])

@@ -41,6 +41,7 @@ DEFAULT_OUTPUT_PATHS = {
     "experiment": "output/experiment.py",
     "run_experiment": "output/experiment_run/results.json",
 }
+PLANNER_LLM_TIMEOUT_SECONDS = 20
 
 
 def _failed_counts(state: AgentState) -> dict[str, int]:
@@ -304,6 +305,21 @@ def fallback_plan(state: AgentState) -> dict:
     }
 
 
+def _normalize_planner_output(parsed: object, state: AgentState, baseline_plan: dict) -> dict:
+    """Normalize and validate planner output with immediate fallback behavior."""
+    if not isinstance(parsed, dict):
+        return baseline_plan
+
+    action = str(parsed.get("action", "")).strip().lower()
+    if action not in PLANNER_ACTIONS:
+        return baseline_plan
+
+    thought = str(parsed.get("thought", "")).strip() or baseline_plan["thought"]
+    input_text = str(parsed.get("input", "")).strip() or _default_input_for(action, state)
+    candidate = {"thought": thought, "action": action, "input": input_text}
+    return _apply_failure_guard(candidate, state)
+
+
 def plan_next_step(state: AgentState, config: Config) -> dict:
     """Plan the next agent action using LLM output with a deterministic fallback."""
     baseline_plan = fallback_plan(state)
@@ -321,18 +337,14 @@ def plan_next_step(state: AgentState, config: Config) -> dict:
             temperature=0.1,
             max_tokens=config.max_tokens,
             response_format={"type": "json_object"},
+            timeout=PLANNER_LLM_TIMEOUT_SECONDS,
         )
         content = response.choices[0].message.content or "{}"
-        parsed = json.loads(content)
-
-        action = str(parsed.get("action", "")).strip().lower()
-        thought = str(parsed.get("thought", "")).strip() or baseline_plan["thought"]
-        input_text = str(parsed.get("input", "")).strip() or _default_input_for(action, state)
-
-        if action not in PLANNER_ACTIONS:
+        try:
+            parsed = json.loads(content)
+        except json.JSONDecodeError:
             return baseline_plan
 
-        candidate = {"thought": thought, "action": action, "input": input_text}
-        return _apply_failure_guard(candidate, state)
+        return _normalize_planner_output(parsed, state, baseline_plan)
     except Exception:
         return baseline_plan
