@@ -11,12 +11,14 @@ from rich.table import Table
 
 try:
     from .agent_loop import run_agent
+    from .eval_harness import safe_run_benchmark
     from .fetcher import fetch_papers
     from .models import ExperimentPlan, HypothesisItem, Paper
     from .reporter import generate_report
     from .utils import display_papers, load_from_json, save_json_data, save_report, save_to_json
 except ImportError:  # pragma: no cover - fallback for direct script execution
     from agent_loop import run_agent
+    from eval_harness import safe_run_benchmark
     from fetcher import fetch_papers
     from models import ExperimentPlan, HypothesisItem, Paper
     from reporter import generate_report
@@ -55,6 +57,7 @@ DEFAULT_RUN_EXPERIMENT_TIMEOUT = 120
 DEFAULT_RUN_EXPERIMENT_SUMMARY_PATH = "output/experiment_run_summary.json"
 DEFAULT_AGENT_OUTPUT_PATH = "output/agent_run.json"
 DEFAULT_AGENT_MAX_ITERATIONS = 6
+DEFAULT_BENCHMARK_OUTPUT_DIR = "output/evals"
 DEFAULT_PROVIDER = "ollama"
 DEFAULT_MODEL = "llama3.2"
 EMPTY_TOPIC_MESSAGE = "Please provide a non-empty research topic."
@@ -83,6 +86,8 @@ EXPERIMENT_PRINT_ERROR = "Could not render experiment scaffold preview: {error}"
 RUN_EXPERIMENT_PRINT_ERROR = "Could not render run summary preview: {error}"
 AGENT_RUN_ERROR = "Agent run failed: {error}"
 AGENT_PRINT_ERROR = "Could not render agent run summary: {error}"
+BENCHMARK_RUN_ERROR = "Benchmark run failed: {error}"
+BENCHMARK_PRINT_ERROR = "Could not render benchmark summary: {error}"
 
 
 def _truncate(text: str, limit: int = TITLE_LIMIT) -> str:
@@ -416,6 +421,42 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         dest="print_agent",
         help="Print a readable summary of the agent run",
+    )
+
+    benchmark_parser = subparsers.add_parser("benchmark", help="Run a lightweight benchmark over multiple topics")
+    benchmark_parser.add_argument(
+        "--provider",
+        default=DEFAULT_PROVIDER,
+        choices=["openai", "ollama"],
+        help=PROVIDER_HELP_TEXT,
+    )
+    benchmark_parser.add_argument(
+        "--model",
+        default=DEFAULT_MODEL,
+        help=MODEL_HELP_TEXT,
+    )
+    benchmark_parser.add_argument(
+        "--max-iterations",
+        type=int,
+        default=DEFAULT_AGENT_MAX_ITERATIONS,
+        help="Maximum iterations to allow per benchmark task",
+    )
+    benchmark_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional number of benchmark tasks to run",
+    )
+    benchmark_parser.add_argument(
+        "--output-dir",
+        default=DEFAULT_BENCHMARK_OUTPUT_DIR,
+        help="Directory to save benchmark run and score artifacts",
+    )
+    benchmark_parser.add_argument(
+        "--print",
+        action="store_true",
+        dest="print_benchmark",
+        help="Print aggregate metrics and per-task score rows",
     )
 
     return parser
@@ -1041,6 +1082,41 @@ def _display_agent_run_summary(run_result: dict, console: Console) -> None:
     console.print(paths_table)
 
 
+def _display_benchmark_summary(result: dict, console: Console) -> None:
+    """Display benchmark aggregate metrics and per-task scores."""
+    aggregate = result.get("aggregate", {})
+    aggregate_table = Table(title="Benchmark Aggregate", show_header=False, box=None)
+    aggregate_table.add_row("Task Count", str(aggregate.get("task_count", 0)))
+    aggregate_table.add_row("Completed Count", str(aggregate.get("completed_count", 0)))
+    aggregate_table.add_row("Avg Total Score", str(aggregate.get("average_total_score", 0.0)))
+    aggregate_table.add_row("Avg Artifact Score", str(aggregate.get("average_artifact_score", 0.0)))
+    aggregate_table.add_row("Avg Iteration Score", str(aggregate.get("average_iteration_score", 0.0)))
+    aggregate_table.add_row("Avg Experiment Score", str(aggregate.get("average_experiment_score", 0.0)))
+    aggregate_table.add_row("Best Task", str(aggregate.get("best_task", "")))
+    aggregate_table.add_row("Worst Task", str(aggregate.get("worst_task", "")))
+    console.print(aggregate_table)
+
+    task_table = Table(title="Benchmark Tasks", show_header=True, header_style="bold cyan")
+    task_table.add_column("Topic", overflow="fold")
+    task_table.add_column("Completed", width=10)
+    task_table.add_column("Total", width=8, justify="right")
+    task_table.add_column("Artifacts", width=10, justify="right")
+    task_table.add_column("Iterations", width=10, justify="right")
+
+    for row in result.get("scores", []):
+        if not isinstance(row, dict):
+            continue
+        task_table.add_row(
+            _truncate(str(row.get("topic", "")), limit=45),
+            str(row.get("completed", False)),
+            str(row.get("total_score", 0.0)),
+            str(row.get("artifact_score", 0.0)),
+            str(row.get("iterations", 0)),
+        )
+
+    console.print(task_table)
+
+
 def _run_agent(args: argparse.Namespace, console: Console) -> None:
     """Run the autonomous agent subcommand."""
     topic = args.topic.strip()
@@ -1081,6 +1157,51 @@ def _run_agent(args: argparse.Namespace, console: Console) -> None:
             _display_agent_run_summary(run_result, console)
         except Exception as error:
             console.print(f"[yellow]{AGENT_PRINT_ERROR.format(error=error)}[/yellow]")
+
+
+def _run_benchmark(args: argparse.Namespace, console: Console) -> None:
+    """Run the benchmark subcommand."""
+    if args.max_iterations <= 0:
+        console.print(f"[yellow]{INVALID_AGENT_ITERATIONS_MESSAGE}[/yellow]")
+        return
+
+    limit_value = args.limit if args.limit and args.limit > 0 else None
+    banner = Panel.fit(
+        f"[bold]Provider:[/bold] {args.provider}\n"
+        f"[bold]Model:[/bold] {args.model}\n"
+        f"[bold]Max Iterations:[/bold] {args.max_iterations}\n"
+        f"[bold]Limit:[/bold] {limit_value if limit_value is not None else 'all'}\n"
+        f"[bold]Output Dir:[/bold] {args.output_dir}",
+        title=f"{APP_NAME} Benchmark",
+        border_style="bright_cyan",
+    )
+    console.print(banner)
+
+    result = safe_run_benchmark(
+        provider=args.provider,
+        model=args.model,
+        max_iterations=args.max_iterations,
+        limit=limit_value,
+        output_dir=args.output_dir,
+    )
+
+    if not bool(result.get("success")):
+        console.print(f"[yellow]{BENCHMARK_RUN_ERROR.format(error=result.get('error', 'unknown error'))}[/yellow]")
+        return
+
+    output_paths = result.get("output_paths", {})
+    results_path = output_paths.get("results_json")
+    scores_path = output_paths.get("scores_csv")
+    if isinstance(results_path, str):
+        console.print(f"[green]{SAVE_SUCCESS_MESSAGE.format(filepath=results_path)}[/green]")
+    if isinstance(scores_path, str):
+        console.print(f"[green]{SAVE_SUCCESS_MESSAGE.format(filepath=scores_path)}[/green]")
+
+    if args.print_benchmark:
+        try:
+            _display_benchmark_summary(result, console)
+        except Exception as error:
+            console.print(f"[yellow]{BENCHMARK_PRINT_ERROR.format(error=error)}[/yellow]")
 
 
 def main() -> None:
@@ -1127,6 +1248,10 @@ def main() -> None:
 
     if args.command == "agent":
         _run_agent(args, console)
+        return
+
+    if args.command == "benchmark":
+        _run_benchmark(args, console)
         return
 
 
