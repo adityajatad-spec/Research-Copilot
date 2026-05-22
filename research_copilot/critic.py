@@ -148,14 +148,38 @@ def _has_unblocked_missing_action(state: AgentState, snapshot: dict[str, Any]) -
 def _format_decision(snapshot: dict[str, Any], status: str, reason: str) -> dict:
     """Return critic decision with debug-friendly artifact context."""
     detected = snapshot.get("status", {})
+    inspection = snapshot.get("inspection", {})
     completed_steps = snapshot.get("completed_steps", [])
     next_missing = snapshot.get("next_missing_step")
+    artifact_details: dict[str, str] = {}
+    hypotheses_status = "missing"
+    hypotheses_detail = "missing"
+    if isinstance(inspection, dict):
+        for action, info in inspection.items():
+            if isinstance(info, dict):
+                artifact_details[str(action)] = str(info.get("detail", ""))
+
+        hypotheses_info = inspection.get("hypotheses", {})
+        if isinstance(hypotheses_info, dict):
+            hypotheses_detail = str(hypotheses_info.get("detail", "missing"))
+            if bool(hypotheses_info.get("ready", False)):
+                hypotheses_status = "valid"
+            elif (
+                "malformed" in hypotheses_detail
+                or "invalid JSON" in hypotheses_detail
+                or "empty" in hypotheses_detail
+            ):
+                hypotheses_status = "malformed"
+
     return {
         "status": status,
         "reason": reason,
         "detected_artifacts": detected if isinstance(detected, dict) else {},
+        "artifact_details": artifact_details,
         "completed_steps": completed_steps if isinstance(completed_steps, list) else [],
         "next_missing_step": next_missing if isinstance(next_missing, str) else None,
+        "hypotheses_status": hypotheses_status,
+        "hypotheses_detail": hypotheses_detail,
     }
 
 

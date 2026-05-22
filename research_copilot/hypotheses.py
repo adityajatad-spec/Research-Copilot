@@ -40,13 +40,16 @@ For each hypothesis:
 
 Return ONLY valid JSON with this exact schema:
 {
-  "generated_from_gaps": [
-    "one-line description of the primary gap this research addresses"
-  ],
-  "hypotheses": [
+  "detected_context": "short topic/context label",
+  "source_artifacts": ["summarize", "report", "insights", "gaps"],
+  "candidate_hypotheses": [
     {
       "title": "Short descriptive title for this research direction",
-      "hypothesis": "One specific, testable research claim",
+      "claim": "One specific, testable research claim",
+      "supporting_evidence": ["evidence item 1", "evidence item 2"],
+      "confidence": 0.75,
+      "priority": "high",
+      "next_actions": ["concrete next action 1", "concrete next action 2"],
       "novelty_rationale": "Why this has not been done or done well",
       "feasibility_rationale": "Why a researcher could execute this now",
       "experiment_plan": {
@@ -58,15 +61,22 @@ Return ONLY valid JSON with this exact schema:
           "Practical note 1",
           "Practical note 2"
         ]
-      }
+      },
+      "notes": "Any caveat or validation need"
     }
-  ]
+  ],
+  "generated_from_gaps": [
+    "one-line description of the primary gap this research addresses"
+  ],
+  "notes": "Brief report-level caveat"
 }
 
 Rules:
-- Return EXACTLY 3 hypotheses in the list
+- Return EXACTLY 3 candidate_hypotheses in the list
 - generated_from_gaps should list the 2-3 gaps most relevant to these hypotheses
 - Each hypothesis must be grounded in the literature evidence provided
+- confidence must be a number between 0 and 1
+- priority must be one of: high, medium, low
 - Keep experiment plans realistic for a solo ML researcher
 - Be conservative and evidence-based
 """.strip()
@@ -214,10 +224,53 @@ def _normalize_string_list(value: object) -> list[str]:
     return [str(item).strip() for item in value if str(item).strip()]
 
 
-def _parse_experiment_plan(value: object) -> ExperimentPlan:
+def _normalize_confidence(value: object) -> float | None:
+    """Normalize parsed confidence into a bounded float."""
+    try:
+        confidence = float(value)
+    except (TypeError, ValueError):
+        return None
+    return max(0.0, min(1.0, confidence))
+
+
+def _normalize_priority(value: object) -> str:
+    """Normalize parsed priority into a known label."""
+    priority = str(value or "").strip().lower()
+    if priority in {"high", "medium", "low"}:
+        return priority
+    return "medium"
+
+
+def _detect_source_artifacts(papers: list[Paper], insights_data: dict | None, gap_data: dict | None) -> list[str]:
+    """Infer which upstream artifacts contributed evidence."""
+    artifacts: list[str] = []
+    if any(paper.summary is not None for paper in papers):
+        artifacts.append("summarize")
+    if insights_data:
+        artifacts.append("insights")
+    if gap_data:
+        artifacts.append("gaps")
+    if papers:
+        artifacts.append("papers")
+    return artifacts
+
+
+def _default_experiment_plan(claim: str, next_actions: list[str]) -> ExperimentPlan:
+    """Build a safe experiment plan when model output omits details."""
+    return ExperimentPlan(
+        objective=f"Evaluate hypothesis: {claim}" if claim else "Evaluate the proposed hypothesis.",
+        datasets=[],
+        baselines=[],
+        metrics=[],
+        implementation_notes=next_actions or [NO_DATA_AVAILABLE],
+    )
+
+
+def _parse_experiment_plan(value: object, claim: str = "", next_actions: list[str] | None = None) -> ExperimentPlan:
     """Parse a nested experiment plan object."""
+    safe_next_actions = next_actions or []
     if not isinstance(value, dict):
-        raise ValueError("Invalid experiment_plan payload.")
+        return _default_experiment_plan(claim, safe_next_actions)
 
     objective = str(value.get("objective", "")).strip()
     datasets = _normalize_string_list(value.get("datasets"))
@@ -226,7 +279,7 @@ def _parse_experiment_plan(value: object) -> ExperimentPlan:
     implementation_notes = _normalize_string_list(value.get("implementation_notes"))
 
     if not objective:
-        raise ValueError("Missing experiment objective.")
+        return _default_experiment_plan(claim, safe_next_actions)
 
     return ExperimentPlan(
         objective=objective,
@@ -237,13 +290,54 @@ def _parse_experiment_plan(value: object) -> ExperimentPlan:
     )
 
 
+def _parse_hypothesis_item(raw_item: object) -> HypothesisItem | None:
+    """Parse one hypothesis payload into a typed item."""
+    if not isinstance(raw_item, dict):
+        return None
+
+    title = str(raw_item.get("title", "")).strip()
+    claim = str(raw_item.get("claim") or raw_item.get("hypothesis") or "").strip()
+    supporting_evidence = _normalize_string_list(raw_item.get("supporting_evidence"))
+    confidence = _normalize_confidence(raw_item.get("confidence"))
+    priority = _normalize_priority(raw_item.get("priority"))
+    next_actions = _normalize_string_list(raw_item.get("next_actions"))
+    novelty_rationale = str(raw_item.get("novelty_rationale", "")).strip()
+    feasibility_rationale = str(raw_item.get("feasibility_rationale", "")).strip()
+    notes = str(raw_item.get("notes", "")).strip()
+
+    if not title or not claim:
+        return None
+
+    if not novelty_rationale:
+        novelty_rationale = "Novelty requires validation against the cited evidence."
+    if not feasibility_rationale:
+        feasibility_rationale = "Feasibility depends on available datasets, baselines, and compute budget."
+
+    return HypothesisItem(
+        title=title,
+        hypothesis=claim,
+        novelty_rationale=novelty_rationale,
+        feasibility_rationale=feasibility_rationale,
+        experiment_plan=_parse_experiment_plan(raw_item.get("experiment_plan"), claim, next_actions),
+        supporting_evidence=supporting_evidence,
+        confidence=confidence,
+        priority=priority,
+        next_actions=next_actions,
+        notes=notes,
+    )
+
+
 def fallback_hypothesis_report(topic: str, papers: list[Paper]) -> HypothesisReport:
     """Build a safe fallback hypothesis report."""
+    report_topic = topic.strip() or "Unspecified Topic"
     return HypothesisReport(
-        topic=topic.strip() or "Unspecified Topic",
+        topic=report_topic,
         paper_count=len(papers),
         generated_from_gaps=[FAILED_EXTRACTION],
         hypotheses=[],
+        detected_context=report_topic,
+        source_artifacts=_detect_source_artifacts(papers, None, None),
+        notes=FAILED_EXTRACTION,
     )
 
 
@@ -263,6 +357,9 @@ def extract_hypotheses(
             paper_count=0,
             generated_from_gaps=[],
             hypotheses=[],
+            detected_context=report_topic,
+            source_artifacts=[],
+            notes="No papers were available for hypothesis generation.",
         )
 
     validate_provider_setup(config)
@@ -289,35 +386,24 @@ def extract_hypotheses(
         parsed = json.loads(content)
 
         generated_from_gaps = _normalize_string_list(parsed.get("generated_from_gaps"))
-        raw_hypotheses = parsed.get("hypotheses")
+        source_artifacts = _normalize_string_list(parsed.get("source_artifacts"))
+        if not source_artifacts:
+            source_artifacts = _detect_source_artifacts(papers, insights_data, gap_data)
+
+        raw_hypotheses = parsed.get("candidate_hypotheses")
+        if not isinstance(raw_hypotheses, list):
+            raw_hypotheses = parsed.get("hypotheses")
         if not isinstance(raw_hypotheses, list):
             return fallback_hypothesis_report(report_topic, papers)
 
         hypothesis_items: list[HypothesisItem] = []
         for raw_item in raw_hypotheses[:3]:
-            if not isinstance(raw_item, dict):
-                return fallback_hypothesis_report(report_topic, papers)
+            hypothesis_item = _parse_hypothesis_item(raw_item)
+            if hypothesis_item is None:
+                continue
+            hypothesis_items.append(hypothesis_item)
 
-            title = str(raw_item.get("title", "")).strip()
-            hypothesis_text = str(raw_item.get("hypothesis", "")).strip()
-            novelty_rationale = str(raw_item.get("novelty_rationale", "")).strip()
-            feasibility_rationale = str(raw_item.get("feasibility_rationale", "")).strip()
-            experiment_plan = _parse_experiment_plan(raw_item.get("experiment_plan"))
-
-            if not title or not hypothesis_text or not novelty_rationale or not feasibility_rationale:
-                return fallback_hypothesis_report(report_topic, papers)
-
-            hypothesis_items.append(
-                HypothesisItem(
-                    title=title,
-                    hypothesis=hypothesis_text,
-                    novelty_rationale=novelty_rationale,
-                    feasibility_rationale=feasibility_rationale,
-                    experiment_plan=experiment_plan,
-                )
-            )
-
-        if len(hypothesis_items) != 3:
+        if not hypothesis_items:
             return fallback_hypothesis_report(report_topic, papers)
 
         return HypothesisReport(
@@ -325,6 +411,9 @@ def extract_hypotheses(
             paper_count=len(papers),
             generated_from_gaps=generated_from_gaps or [NO_DATA_AVAILABLE],
             hypotheses=hypothesis_items,
+            detected_context=str(parsed.get("detected_context") or report_topic).strip() or report_topic,
+            source_artifacts=source_artifacts,
+            notes=str(parsed.get("notes", "")).strip(),
         )
     except Exception:
         return fallback_hypothesis_report(report_topic, papers)

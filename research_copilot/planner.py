@@ -9,12 +9,12 @@ from typing import Any
 try:
     from .agent_state import AgentState
     from .config import Config, get_client, validate_provider_setup
-    from .memory_store import get_last_successful_action, load_memory, summarize_memory
+    from .memory_store import get_last_successful_action, load_memory, store_memory, summarize_memory
     from .persistent_memory import load_lessons
 except ImportError:  # pragma: no cover - fallback for direct script execution
     from agent_state import AgentState
     from config import Config, get_client, validate_provider_setup
-    from memory_store import get_last_successful_action, load_memory, summarize_memory
+    from memory_store import get_last_successful_action, load_memory, store_memory, summarize_memory
     from persistent_memory import load_lessons
 
 
@@ -62,6 +62,56 @@ def _safe_load_json(path: Path) -> object | None:
         return json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return None
+
+
+def validate_hypotheses_payload(payload: object) -> tuple[bool, str]:
+    """Validate the structured hypotheses artifact schema."""
+    if not isinstance(payload, dict):
+        return False, "hypotheses malformed: expected JSON object"
+
+    detected_context = str(payload.get("detected_context") or payload.get("topic") or "").strip()
+    if not detected_context:
+        return False, "hypotheses malformed: missing detected_context"
+
+    source_artifacts = payload.get("source_artifacts")
+    if not isinstance(source_artifacts, list) or not all(isinstance(item, str) and item.strip() for item in source_artifacts):
+        return False, "hypotheses malformed: source_artifacts must be a non-empty string list"
+
+    candidates = payload.get("candidate_hypotheses")
+    if candidates is None:
+        candidates = payload.get("hypotheses")
+    if not isinstance(candidates, list) or not candidates:
+        return False, "hypotheses malformed: candidate_hypotheses must be a non-empty list"
+
+    for index, item in enumerate(candidates, start=1):
+        if not isinstance(item, dict):
+            return False, f"hypotheses malformed: candidate {index} is not an object"
+
+        title = str(item.get("title", "")).strip()
+        claim = str(item.get("claim") or item.get("hypothesis") or "").strip()
+        supporting_evidence = item.get("supporting_evidence")
+        confidence = item.get("confidence")
+        priority = str(item.get("priority", "")).strip().lower()
+        next_actions = item.get("next_actions")
+
+        if not title:
+            return False, f"hypotheses malformed: candidate {index} missing title"
+        if not claim:
+            return False, f"hypotheses malformed: candidate {index} missing claim"
+        if not isinstance(supporting_evidence, list):
+            return False, f"hypotheses malformed: candidate {index} supporting_evidence must be a list"
+        if not isinstance(next_actions, list):
+            return False, f"hypotheses malformed: candidate {index} next_actions must be a list"
+        try:
+            confidence_value = float(confidence)
+        except (TypeError, ValueError):
+            return False, f"hypotheses malformed: candidate {index} confidence must be numeric"
+        if confidence_value < 0.0 or confidence_value > 1.0:
+            return False, f"hypotheses malformed: candidate {index} confidence must be between 0 and 1"
+        if priority not in {"high", "medium", "low"}:
+            return False, f"hypotheses malformed: candidate {index} priority must be high, medium, or low"
+
+    return True, f"valid hypotheses artifact with {len(candidates)} candidate(s)"
 
 
 def _artifact_candidates(state: AgentState, action: str) -> list[Path]:
@@ -119,7 +169,11 @@ def _validate_artifact_file(action: str, path: Path) -> tuple[bool, str]:
             return True, f"JSON list with {len(payload)} item(s)"
         return False, "JSON list missing or empty"
 
-    if action in {"insights", "gaps", "hypotheses", "run_experiment"}:
+    if action == "hypotheses":
+        ready, detail = validate_hypotheses_payload(payload)
+        return ready, detail
+
+    if action in {"insights", "gaps", "run_experiment"}:
         if isinstance(payload, dict) and len(payload) > 0:
             return True, f"JSON object with {len(payload)} key(s)"
         if isinstance(payload, list) and len(payload) > 0:
@@ -574,5 +628,13 @@ def plan_next_step(state: AgentState, config: Config) -> dict:
             return baseline_plan
 
         return _normalize_planner_output(parsed, state, baseline_plan, inspection)
-    except Exception:
+    except Exception as error:
+        detail = str(error) or error.__class__.__name__
+        store_memory(state, "planner_provider_error", detail)
+        debug_skips = baseline_plan.get("debug_skips", [])
+        if not isinstance(debug_skips, list):
+            debug_skips = []
+        debug_skips.append(f"Planner provider unavailable or invalid: {detail}. Used deterministic fallback.")
+        baseline_plan["debug_skips"] = debug_skips
+        baseline_plan["debug_provider_status"] = "unavailable"
         return baseline_plan

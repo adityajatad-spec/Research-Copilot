@@ -670,12 +670,24 @@ def _hypothesis_item_from_dict(data: dict) -> HypothesisItem:
             str(item) for item in experiment_plan_data.get("implementation_notes", []) if str(item).strip()
         ],
     )
+    confidence: float | None = None
+    try:
+        if data.get("confidence") is not None:
+            confidence = float(data["confidence"])
+    except (TypeError, ValueError):
+        confidence = None
+
     return HypothesisItem(
         title=str(data.get("title", "")).strip(),
-        hypothesis=str(data.get("hypothesis", "")).strip(),
+        hypothesis=str(data.get("hypothesis") or data.get("claim") or "").strip(),
         novelty_rationale=str(data.get("novelty_rationale", "")).strip(),
         feasibility_rationale=str(data.get("feasibility_rationale", "")).strip(),
         experiment_plan=plan,
+        supporting_evidence=[str(item) for item in data.get("supporting_evidence", []) if str(item).strip()],
+        confidence=confidence,
+        priority=str(data.get("priority", "medium")).strip() or "medium",
+        next_actions=[str(item) for item in data.get("next_actions", []) if str(item).strip()],
+        notes=str(data.get("notes", "")).strip(),
     )
 
 
@@ -950,7 +962,7 @@ def _run_experiment(args: argparse.Namespace, console: Console) -> None:
         console.print(f"[yellow]{HYPOTHESES_INPUT_ERROR.format(filepath=args.hypotheses)}[/yellow]")
         return
 
-    hypothesis_entries = data.get("hypotheses", []) if isinstance(data, dict) else []
+    hypothesis_entries = (data.get("hypotheses") or data.get("candidate_hypotheses", [])) if isinstance(data, dict) else []
     if not isinstance(hypothesis_entries, list) or not hypothesis_entries:
         console.print(f"[yellow]{HYPOTHESES_EMPTY_ERROR}[/yellow]")
         return

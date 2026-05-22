@@ -348,12 +348,24 @@ def _hypothesis_item_from_dict(data: dict):
         metrics=[str(item) for item in plan_data.get("metrics", []) if str(item).strip()],
         implementation_notes=[str(item) for item in plan_data.get("implementation_notes", []) if str(item).strip()],
     )
+    confidence: float | None = None
+    try:
+        if data.get("confidence") is not None:
+            confidence = float(data["confidence"])
+    except (TypeError, ValueError):
+        confidence = None
+
     return HypothesisItem(
         title=str(data.get("title", "")).strip(),
-        hypothesis=str(data.get("hypothesis", "")).strip(),
+        hypothesis=str(data.get("hypothesis") or data.get("claim") or "").strip(),
         novelty_rationale=str(data.get("novelty_rationale", "")).strip(),
         feasibility_rationale=str(data.get("feasibility_rationale", "")).strip(),
         experiment_plan=plan,
+        supporting_evidence=[str(item) for item in data.get("supporting_evidence", []) if str(item).strip()],
+        confidence=confidence,
+        priority=str(data.get("priority", "medium")).strip() or "medium",
+        next_actions=[str(item) for item in data.get("next_actions", []) if str(item).strip()],
+        notes=str(data.get("notes", "")).strip(),
     )
 
 
@@ -458,6 +470,8 @@ def execute_action(state: AgentState, action: str, input_text: str, provider: st
         save_hypothesis_report(report, OUTPUT_PATHS["hypotheses"])
         store_memory(state, "hypotheses_output_path", OUTPUT_PATHS["hypotheses"])
         store_memory(state, "hypothesis_titles", [item.title for item in report.hypotheses])
+        if not report.hypotheses:
+            raise ValueError("Hypotheses artifact malformed: no candidate hypotheses were generated.")
         return f"Hypothesis report generated with {len(report.hypotheses)} hypotheses."
 
     if action == "experiment":
@@ -475,7 +489,7 @@ def execute_action(state: AgentState, action: str, input_text: str, provider: st
         if not isinstance(report_data, dict):
             raise ValueError("Hypothesis report is unavailable.")
 
-        hypotheses = report_data.get("hypotheses", [])
+        hypotheses = report_data.get("hypotheses") or report_data.get("candidate_hypotheses", [])
         if not isinstance(hypotheses, list) or not hypotheses:
             raise ValueError("No hypotheses available for experiment scaffolding.")
 
@@ -744,6 +758,14 @@ def run_agent(
         next_missing_step = critic_decision.get("next_missing_step")
         if isinstance(next_missing_step, str) and next_missing_step:
             log(f"[agent] Critic next missing step: {next_missing_step}.")
+
+        hypotheses_status = critic_decision.get("hypotheses_status")
+        hypotheses_detail = critic_decision.get("hypotheses_detail")
+        if isinstance(hypotheses_status, str) and hypotheses_status:
+            log(
+                "[agent] Critic hypotheses validation: "
+                f"status={hypotheses_status} detail='{hypotheses_detail}'."
+            )
 
         if critic_decision.get("status") == "done":
             state.done = True

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 @dataclass(slots=True)
@@ -162,15 +162,26 @@ class HypothesisItem:
     novelty_rationale: str
     feasibility_rationale: str
     experiment_plan: ExperimentPlan
+    supporting_evidence: list[str] = field(default_factory=list)
+    confidence: float | None = None
+    priority: str = "medium"
+    next_actions: list[str] = field(default_factory=list)
+    notes: str = ""
 
     def to_dict(self) -> dict:
         """Return the hypothesis item as a plain dictionary."""
         return {
             "title": self.title,
+            "claim": self.hypothesis,
             "hypothesis": self.hypothesis,
+            "supporting_evidence": self.supporting_evidence,
+            "confidence": self.confidence,
+            "priority": self.priority,
+            "next_actions": self.next_actions,
             "novelty_rationale": self.novelty_rationale,
             "feasibility_rationale": self.feasibility_rationale,
             "experiment_plan": self.experiment_plan.to_dict(),
+            "notes": self.notes,
         }
 
 
@@ -182,12 +193,20 @@ class HypothesisReport:
     paper_count: int
     generated_from_gaps: list[str]
     hypotheses: list[HypothesisItem]
+    detected_context: str = ""
+    source_artifacts: list[str] = field(default_factory=list)
+    notes: str = ""
 
     def to_dict(self) -> dict:
         """Return the hypothesis report as a plain dictionary."""
+        hypothesis_items = [item.to_dict() for item in self.hypotheses]
         return {
+            "detected_context": self.detected_context or self.topic,
+            "source_artifacts": self.source_artifacts,
+            "candidate_hypotheses": hypothesis_items,
+            "notes": self.notes,
             "topic": self.topic,
             "paper_count": self.paper_count,
             "generated_from_gaps": self.generated_from_gaps,
-            "hypotheses": [item.to_dict() for item in self.hypotheses],
+            "hypotheses": hypothesis_items,
         }
